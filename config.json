@@ -1,0 +1,8 @@
+{
+    "INPUT_FILE": "cell phone cases (2024.10.1-2025.10.31).xlsx",
+    "BATCH_SIZE": 100,
+    "MAX_BATCHES": null,
+    "MAX_CONCURRENT_REQUESTS": 300,
+    "REQUESTS_PER_MINUTE": 1000,
+    "INCREMENTAL_SAVE_INTERVAL": 15
+}
