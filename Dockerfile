@@ -39,7 +39,7 @@ RUN useradd --create-home --shell /bin/bash appuser && \
 USER appuser
 
 # Expose port for Streamlit
-EXPOSE 8501
+EXPOSE 8000
 
 # Health check to monitor container status
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
