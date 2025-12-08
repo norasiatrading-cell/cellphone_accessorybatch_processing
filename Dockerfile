@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean
 
 # Create directories for data and output
-RUN mkdir -p /app/output /app/batches /app/backups /app/logs /app/uploads
+RUN mkdir -p /app/output /app/batches /app/backups /app/logs /app/uploads /app/static
 
 # Copy requirements file first (for better Docker layer caching)
 COPY requirements.txt .
