@@ -232,7 +232,10 @@ async def upload_file(file: UploadFile = File(...), max_rows: Optional[int] = Fo
             
             rows = len(df)
             columns = len(df.columns)
-            preview = df.head(10).to_dict('records')
+            # Replace NaN, inf, and -inf with None for JSON serialization
+            preview_df = df.head(10).replace([float('inf'), float('-inf')], None)
+            preview_df = preview_df.where(pd.notna(preview_df), None)
+            preview = preview_df.to_dict('records')
         except Exception as e:
             rows = 0
             columns = 0
