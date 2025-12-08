@@ -1,10 +1,12 @@
-# Use Python 3.11 slim image for better performance
+# Use Python 3.11 slim image
 FROM python:3.11-slim
 
-# Set working directory in container
+# Set working directory
 WORKDIR /app
 
 # Environment settings
+# Pythondontwritebytecode: Prevents Python from writing .pyc files
+# Pythonunbuffered: Forces stdout/stderr to be flushed immediately (vital for Railway logs)
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive
@@ -31,14 +33,26 @@ COPY batch_main.py .
 COPY streamlit_app.py .
 COPY batch_config.json .
 
-# Create non-root user
+# Create non-root user and fix permissions
 RUN useradd --create-home --shell /bin/bash appuser \
  && chown -R appuser:appuser /app
+
+# Switch to non-root user
 USER appuser
 
-# Healthcheck using dynamic Railway port
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-  CMD curl -f http://localhost:$PORT/_stcore/health || exit 1
+# --- CHANGE 1: REMOVED INTERNAL HEALTHCHECK ---
+# Railway handles health checks externally. 
+# An internal check that fails (e.g., due to slow startup) can cause Railway to kill a valid app.
 
-# Start Streamlit using Railway-assigned port
-CMD ["sh", "-c", "streamlit run streamlit_app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true"]
+# --- CHANGE 2: OPTIMIZED CMD FOR RAILWAY ---
+# Added:
+# --server.fileWatcherType=none: Prevents CPU spikes on Linux containers
+# --server.enableCORS=false: Prevents timeouts behind Railway's load balancer
+# --server.enableXsrfProtection=false: Prevents 403/Connection issues on some setups
+CMD ["sh", "-c", "streamlit run streamlit_app.py \
+    --server.port=$PORT \
+    --server.address=0.0.0.0 \
+    --server.headless=true \
+    --server.fileWatcherType=none \
+    --server.enableCORS=false \
+    --server.enableXsrfProtection=false"]
