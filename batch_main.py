@@ -224,6 +224,7 @@ class BatchDataProcessor:
         4. Use natural, descriptive language without promotional tone.
         5. Each bullet should be 1–2 sentences long, if needed.
         6. STRICT: Return only a JSON list of exactly 5 bullet points, nothing else.
+        7. Do not use underscores "_" in the bullet points.
 
         Example format:
         [
