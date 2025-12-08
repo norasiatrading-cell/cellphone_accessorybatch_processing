@@ -232,10 +232,35 @@ async def upload_file(file: UploadFile = File(...), max_rows: Optional[int] = Fo
             
             rows = len(df)
             columns = len(df.columns)
-            # Replace NaN, inf, and -inf with None for JSON serialization
-            preview_df = df.head(10).replace([float('inf'), float('-inf')], None)
+            
+            # Convert to JSON-safe format
+            preview_df = df.head(10).copy()
+            
+            # Replace inf and -inf with None
+            preview_df = preview_df.replace([float('inf'), float('-inf')], None)
+            
+            # Replace NaN with None
             preview_df = preview_df.where(pd.notna(preview_df), None)
-            preview = preview_df.to_dict('records')
+            
+            # Convert to dict and ensure all values are JSON-serializable
+            preview = []
+            for record in preview_df.to_dict('records'):
+                clean_record = {}
+                for key, value in record.items():
+                    if pd.isna(value) if isinstance(value, (int, float)) else False:
+                        clean_record[key] = None
+                    elif isinstance(value, (int, float)):
+                        # Check if it's inf or -inf
+                        if value == float('inf') or value == float('-inf'):
+                            clean_record[key] = None
+                        else:
+                            clean_record[key] = value
+                    elif isinstance(value, pd.Timestamp):
+                        clean_record[key] = value.isoformat()
+                    else:
+                        clean_record[key] = value
+                preview.append(clean_record)
+                
         except Exception as e:
             rows = 0
             columns = 0
