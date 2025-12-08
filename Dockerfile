@@ -39,7 +39,8 @@ USER appuser
 # --- FIXED CMD (Shell Form) ---
 # Removing the brackets [] tells Docker to run this in a shell.
 # This ensures $PORT is correctly converted to a number (e.g., 8080).
-CMD streamlit run streamlit_app.py \
+# CMD streamlit run streamlit_app.py \
+CMD python -m http.server $PORT
     --server.port=$PORT \
     --server.address=0.0.0.0 \
     --server.headless=true \
