@@ -33,7 +33,6 @@ COPY batch_main.py .
 COPY fastapi_app.py .
 COPY batch_config.json .
 COPY templates /app/templates
-COPY static /app/static
 
 # Create a non-root user for security
 RUN useradd --create-home --shell /bin/bash appuser && \
