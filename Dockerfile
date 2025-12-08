@@ -30,6 +30,10 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy application files
 COPY main.py .
 COPY web_interface.py .
+COPY streamlit_app.py .
+COPY batch_main.py .
+COPY batch_config.py .
+COPY batch_results.json .
 COPY config.json .
 COPY templates/ ./templates/
 
@@ -39,11 +43,11 @@ RUN useradd --create-home --shell /bin/bash appuser && \
 USER appuser
 
 # Expose port for web interface
-EXPOSE 8080
+EXPOSE 8000
 
 # Health check to monitor container status
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+    CMD curl -f http://localhost:8000/health || exit 1
 
 # Default command - start web interface
-CMD ["python3", "web_interface.py"]
+CMD ["python3", "streamlit_app.py"]
