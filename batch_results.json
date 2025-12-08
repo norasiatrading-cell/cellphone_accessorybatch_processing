@@ -1,0 +1,9 @@
+{
+  "status": "Completed",
+  "total_rows": 59,
+  "successful_rows": 59,
+  "failed_rows": 0,
+  "start_time": "2025-12-07T17:51:53.980053",
+  "last_updated": "2025-12-07T17:52:08.413654",
+  "output_file": "output/batch_processed_data_20251207_175153.xlsx"
+}
