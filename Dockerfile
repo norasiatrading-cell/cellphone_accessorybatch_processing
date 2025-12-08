@@ -5,7 +5,6 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Environment settings
-# PYTHONUNBUFFERED=1 is CRITICAL for Railway to show logs in real-time
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive
@@ -37,16 +36,12 @@ RUN useradd --create-home --shell /bin/bash appuser \
  && chown -R appuser:appuser /app
 USER appuser
 
-# --- REMOVED HEALTHCHECK ---
-# Railway manages health checks externally. 
-# The internal Docker check often kills valid Streamlit apps that are just slow to boot.
-
-# --- OPTIMIZED CMD ---
-# --server.enableCORS=false: Fixes the timeout by allowing the Railway URL
-# --server.enableXsrfProtection=false: Prevents 403/connection blocks
-CMD ["sh", "-c", "streamlit run streamlit_app.py \
+# --- FIXED CMD (Shell Form) ---
+# Removing the brackets [] tells Docker to run this in a shell.
+# This ensures $PORT is correctly converted to a number (e.g., 8080).
+CMD streamlit run streamlit_app.py \
     --server.port=$PORT \
     --server.address=0.0.0.0 \
     --server.headless=true \
     --server.enableCORS=false \
-    --server.enableXsrfProtection=false"]
+    --server.enableXsrfProtection=false
