@@ -14,11 +14,12 @@ RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     curl \
+    procps \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
 # Create directories for data and output
-RUN mkdir -p /app/output /app/batches /app/backups /app/logs
+RUN mkdir -p /app/output /app/batches /app/backups /app/logs /app/uploads
 
 # Copy requirements file first (for better Docker layer caching)
 COPY requirements.txt .
@@ -28,22 +29,21 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
-COPY main.py .
-COPY web_interface.py .
-COPY config.json .
-COPY templates/ ./templates/
+COPY batch_main.py .
+COPY streamlit_app.py .
+COPY batch_config.json .
 
 # Create a non-root user for security
 RUN useradd --create-home --shell /bin/bash appuser && \
     chown -R appuser:appuser /app
 USER appuser
 
-# Expose port for web interface
-EXPOSE 8080
+# Expose port for Streamlit
+EXPOSE 8501
 
 # Health check to monitor container status
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+    CMD curl -f http://localhost:8000/_stcore/health || exit 1
 
-# Default command - start web interface
-CMD ["python3", "web_interface.py"]
+# Default command - start Streamlit app
+CMD ["streamlit", "run", "streamlit_app.py", "--server.port=8000", "--server.address=0.0.0.0", "--server.headless=true"]
