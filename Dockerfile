@@ -1,21 +1,43 @@
+# Use Python 3.11 slim image
 FROM python:3.11-slim
 
+# Set working directory
 WORKDIR /app
 
+# Environment settings
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive
 
-# Install minimal dependencies
-RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    curl \
+    procps \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
-# Copy only the debug script
-COPY debug_run.py .
+# Create folders
+RUN mkdir -p /app/output /app/batches /app/backups /app/logs /app/uploads
 
-# --- TEMPORARILY RUN AS ROOT ---
-# This rules out any permission issues with 'appuser'
-# USER appuser 
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
 
-# --- RUN DEBUG SCRIPT ---
-# This bypasses shell variable expansion issues entirely
-CMD ["python", "debug_run.py"]
+# Copy application files (Including the new wrapper)
+COPY batch_main.py .
+COPY streamlit_app.py .
+COPY batch_config.json .
+COPY run_app.py .
+
+# Create non-root user and fix permissions
+RUN useradd --create-home --shell /bin/bash appuser \
+ && chown -R appuser:appuser /app
+USER appuser
+
+# --- FINAL FIX ---
+# Instead of a complex shell command, we run the Python wrapper.
+# This handles the PORT variable safely inside Python.
+CMD ["python", "run_app.py"]
