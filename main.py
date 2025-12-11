@@ -944,9 +944,9 @@ or
                     return ((base // 10) * 10) + 9
                 
                 # Calculate Our Price with debugging
-                our_price_calc = (unit_price * 1.3 * 90 * 5) + (result['Calculated Weight'] * 1000 * 5) + 150
+                our_price_calc = (unit_price * 1.6 * 90 * 5) + (result['Calculated Weight'] * 1000 * 1.3 * 5) + 600
                 result['Our Price'] = our_price_calc
-                print(f"  Our Price calculation: ({unit_price} * 1.3 * 90 * 5) + ({result['Calculated Weight']} * 1000 * 5) + 150 = {our_price_calc}")
+                print(f"  Our Price calculation: ({unit_price} * 1.6 * 90 * 5) + ({result['Calculated Weight']} * 1000 * 1.3 * 5) + 150 = {our_price_calc}")
                 
                 result['Our Price Rounded'] = round_to_nine(result['Our Price'])
                 print(f"  Our Price Rounded: {result['Our Price Rounded']}")
