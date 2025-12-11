@@ -1114,7 +1114,7 @@ or
                 return float(str(int(price))[:-1] + '9')
         
         # Calculate prices
-        our_price_calc = (unit_price * 1.3 * 90 * 5) + (df.at[row_idx, 'Calculated Weight'] * 1000 * 5) + 150
+        our_price_calc = (unit_price * 1.6 * 90 * 5) + (df.at[row_idx, 'Calculated Weight'] * 1000 * 1.3 * 5) + 600
         df.at[row_idx, 'Our Price'] = our_price_calc
         df.at[row_idx, 'Our Price Rounded'] = round_to_nine(our_price_calc)
         
