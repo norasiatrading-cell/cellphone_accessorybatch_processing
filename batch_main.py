@@ -77,9 +77,10 @@ def save_dataframe(df: pd.DataFrame, file_path: str) -> None:
 class BatchDataProcessor:
     """Main class for processing CSV/Excel data with Groq Batch API"""
     
-    def __init__(self, api_key: str, max_rows: Optional[int] = None):
+    def __init__(self, api_key: str, max_rows: Optional[int] = None, max_requests_per_batch: int = 10000):
         self.client = Groq(api_key=api_key)
         self.max_rows = max_rows
+        self.max_requests_per_batch = max_requests_per_batch  # Groq's safe limit per batch
         
         # Statistics tracking
         self.total_rows = 0
@@ -615,6 +616,66 @@ or
         self.total_batch_requests = len(self.batch_requests)
         logger.info(f"Prepared {self.total_batch_requests} batch requests for {len(regular_rows)} rows")
 
+    def submit_batch_jobs_in_chunks(self) -> List[str]:
+        """Submit batch requests in chunks to respect API limits"""
+        total_requests = len(self.batch_requests)
+        
+        if total_requests <= self.max_requests_per_batch:
+            # Single batch - use original method
+            logger.info(f"Submitting single batch with {total_requests} requests")
+            batch_id = self.submit_batch_job()
+            return [batch_id]
+        
+        # Split into multiple batches
+        num_batches = (total_requests + self.max_requests_per_batch - 1) // self.max_requests_per_batch
+        logger.info(f"Splitting {total_requests} requests into {num_batches} batches (max {self.max_requests_per_batch} per batch)")
+        
+        batch_ids = []
+        for batch_num in range(num_batches):
+            start_idx = batch_num * self.max_requests_per_batch
+            end_idx = min((batch_num + 1) * self.max_requests_per_batch, total_requests)
+            chunk = self.batch_requests[start_idx:end_idx]
+            
+            logger.info(f"Submitting batch {batch_num + 1}/{num_batches} with {len(chunk)} requests")
+            batch_id = self.submit_single_batch_chunk(chunk, batch_num)
+            batch_ids.append(batch_id)
+            
+            # Small delay between submissions
+            if batch_num < num_batches - 1:
+                time.sleep(1)
+        
+        logger.info(f"Successfully submitted {num_batches} batch jobs")
+        return batch_ids
+    
+    def submit_single_batch_chunk(self, requests: List[Dict], batch_num: int) -> str:
+        """Submit a single batch chunk to Groq"""
+        # Create batch file
+        batch_file_path = f"batch_requests_chunk_{batch_num}.jsonl"
+        with open(batch_file_path, 'w') as f:
+            for request in requests:
+                f.write(json.dumps(request) + '\n')
+        
+        # Upload batch file
+        with open(batch_file_path, 'rb') as f:
+            batch_file = self.client.files.create(
+                file=f,
+                purpose='batch'
+            )
+        
+        # Create batch job
+        batch_job = self.client.batches.create(
+            input_file_id=batch_file.id,
+            endpoint="/v1/chat/completions",
+            completion_window="24h"
+        )
+        
+        logger.info(f"Batch chunk {batch_num} submitted with ID: {batch_job.id}")
+        
+        # Clean up local file
+        os.remove(batch_file_path)
+        
+        return batch_job.id
+
     def submit_batch_job(self) -> str:
         """Submit batch job to Groq"""
         logger.info("Submitting batch job to Groq...")
@@ -646,10 +707,31 @@ or
         
         return batch_job.id
 
+    def wait_for_multiple_batch_completions(self, batch_job_ids: List[str]) -> List[Dict]:
+        """Wait for multiple batch jobs to complete and return all results"""
+        logger.info(f"Waiting for {len(batch_job_ids)} batch jobs to complete...")
+        self.save_progress(f"Waiting for {len(batch_job_ids)} batch jobs")
+        
+        completed_jobs = []
+        start_time = time.time()
+        
+        for idx, batch_job_id in enumerate(batch_job_ids):
+            logger.info(f"Processing batch {idx + 1}/{len(batch_job_ids)}: {batch_job_id}")
+            self.save_progress(f"Waiting for batch {idx + 1}/{len(batch_job_ids)}")
+            
+            batch_job = self.wait_for_batch_completion(batch_job_id)
+            completed_jobs.append(batch_job)
+            
+            logger.info(f"Batch {idx + 1}/{len(batch_job_ids)} completed")
+        
+        elapsed_time = (time.time() - start_time) / 60
+        logger.info(f"All {len(batch_job_ids)} batches completed in {elapsed_time:.1f} minutes")
+        
+        return completed_jobs
+
     def wait_for_batch_completion(self, batch_job_id: str) -> Dict:
-        """Wait for batch job to complete and return results"""
+        """Wait for a single batch job to complete and return results"""
         logger.info(f"Waiting for batch job {batch_job_id} to complete...")
-        self.save_progress("Waiting for batch completion")
         
         start_time = time.time()
         last_status_log = 0
@@ -719,9 +801,23 @@ or
         
         return batch_job
 
+    def download_and_parse_all_results(self, batch_jobs: List[Dict]) -> Dict[str, Dict]:
+        """Download and parse results from multiple batch jobs"""
+        logger.info(f"Downloading and parsing results from {len(batch_jobs)} batch jobs...")
+        
+        all_results = {}
+        
+        for idx, batch_job in enumerate(batch_jobs):
+            logger.info(f"Downloading results from batch {idx + 1}/{len(batch_jobs)}: {batch_job.id}")
+            results = self.download_and_parse_results(batch_job)
+            all_results.update(results)
+        
+        logger.info(f"Total results parsed: {len(all_results)}")
+        return all_results
+
     def download_and_parse_results(self, batch_job) -> Dict[str, Dict]:
-        """Download and parse batch results"""
-        logger.info("Downloading and parsing batch results...")
+        """Download and parse batch results from a single job"""
+        logger.info(f"Downloading results for batch job {batch_job.id}...")
         
         # Download output file
         output_file = self.client.files.content(batch_job.output_file_id)
@@ -762,7 +858,7 @@ or
                 logger.error(f"Line content: {line[:200]}...")
         
         if failed_requests:
-            logger.warning(f"Failed requests: {len(failed_requests)}")
+            logger.warning(f"Failed requests in this batch: {len(failed_requests)}")
             for req_id in failed_requests[:10]:  # Show first 10
                 logger.warning(f"  - {req_id}")
         
@@ -1109,16 +1205,23 @@ or
         self.prepare_batch_requests(df)
         self.save_progress("Preparing batch requests")
         
-        # Submit batch job
-        batch_job_id = self.submit_batch_job()
-        self.save_progress("Batch job submitted, waiting for completion")
+        # Submit batch jobs (chunked if necessary)
+        batch_job_ids = self.submit_batch_jobs_in_chunks()
+        self.save_progress(f"{len(batch_job_ids)} batch job(s) submitted, waiting for completion")
         
-        # Wait for completion
-        batch_job = self.wait_for_batch_completion(batch_job_id)
-        self.save_progress("Batch completed, downloading results")
+        # Wait for all batches to complete
+        if len(batch_job_ids) == 1:
+            # Single batch - use original method
+            batch_job = self.wait_for_batch_completion(batch_job_ids[0])
+            completed_jobs = [batch_job]
+        else:
+            # Multiple batches
+            completed_jobs = self.wait_for_multiple_batch_completions(batch_job_ids)
         
-        # Download and parse results
-        batch_results = self.download_and_parse_results(batch_job)
+        self.save_progress("All batches completed, downloading results")
+        
+        # Download and parse results from all batches
+        batch_results = self.download_and_parse_all_results(completed_jobs)
         with open("batch_results.json", "w") as f:
             json.dump(batch_results, f)
         
@@ -1206,19 +1309,21 @@ def main():
     input_ext = get_output_file_extension(INPUT_FILE)
     OUTPUT_FILE = f"batch_processed_data_{timestamp}{input_ext}"
     
-    # Create processor
+    # Create processor with batch size limit
     processor = BatchDataProcessor(
         api_key=api_key,
-        max_rows=MAX_ROWS
+        max_rows=MAX_ROWS,
+        max_requests_per_batch=200# Groq's safe limit (adjust if needed)
     )
     
     print(f"\n🚀 Starting BATCH processing:")
     print(f"   • Input file: {INPUT_FILE}")
     print(f"   • Max rows: {MAX_ROWS if MAX_ROWS else 'No limit'}")
+    print(f"   • Max requests per batch: 10,000 (auto-chunking enabled)")
     print(f"   • Cost savings: ~50% compared to real-time API")
     print(f"   • Processing mode: Batch (submit all → wait → get results)")
     print(f"   • Expected batch completion: 5-30 minutes depending on queue")
-    print(f"\n💡 Note: No real-time progress updates during batch processing")
+    print(f"\n💡 Note: Large datasets will be automatically split into multiple batches")
     print(f"🔄 Batch jobs are processed asynchronously by Groq's servers\n")
     
     # Run the processing

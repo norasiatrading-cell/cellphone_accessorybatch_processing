@@ -15,8 +15,13 @@ import pandas as pd
 from typing import Optional
 import shutil
 
-# Initialize FastAPI app
-app = FastAPI(title="Batch Data Processor", version="1.0.0")
+# Initialize FastAPI app with increased max file size
+# Set max upload size to 500MB for large datasets
+app = FastAPI(
+    title="Batch Data Processor",
+    version="1.0.0",
+    max_request_size=500 * 1024 * 1024  # 500 in megabytes
+)
 
 # Directories
 UPLOADS_DIR = Path("./uploads")
