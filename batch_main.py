@@ -278,7 +278,7 @@ class BatchDataProcessor:
         - Don't add new features or promotional words
         - Don't repeat words like "case" or "cover"
         - Format: [Case Type] [Material]"Case" [Device] [Features] - [Pattern]
-        Example: "Wallet Leather Galaxy A07/A06 4G/5G Flip Cover with Strap - Don't Touch My Phone"
+        Example: "Wallet Leather Galaxy For A07/A06 4G/5G Flip Cover with Strap - Don't Touch My Phone"
 
         MATERIAL: Identify the PRIMARY material with full names and abbreviations where applicable.
         Examples: "TPU (Thermoplastic Polyurethane)", "PC (Polycarbonate)", "PU Leather", "Genuine Leather", "Faux Leather", "Silicone", "Metal", "Glass", "Fabric", "Plastic"
@@ -1162,12 +1162,23 @@ or
             fields_to_copy = [
                 'Feature_1', 'Feature_2', 'Feature_3', 'Feature_4', 'Feature_5',
                 'Bullet_Point_1', 'Bullet_Point_2', 'Bullet_Point_3', 'Bullet_Point_4', 'Bullet_Point_5',
-                'New Title', 'New Description（without HTML format）'
+                'New Title', 'New Title 2', 'New Description（without HTML format）'
             ]
             
             for field in fields_to_copy:
                 if field in df.columns:
                     df.at[parent_idx, field] = df.at[a_idx, field]
+            
+            # Remove sales attribute from titles for parent rows only
+            # Strip everything after " - " from New Title
+            if 'New Title' in df.columns and pd.notna(df.at[parent_idx, 'New Title']):
+                new_title = str(df.at[parent_idx, 'New Title'])
+                df.at[parent_idx, 'New Title'] = re.sub(r' - .+$', '', new_title).strip()
+            
+            # Strip everything after " - " from New Title 2
+            if 'New Title 2' in df.columns and pd.notna(df.at[parent_idx, 'New Title 2']):
+                new_title_2 = str(df.at[parent_idx, 'New Title 2'])
+                df.at[parent_idx, 'New Title 2'] = re.sub(r' - .+$', '', new_title_2).strip()
             
             logger.debug(f"Updated parent {base_sku} with data from child {a_variant_sku}")
         
