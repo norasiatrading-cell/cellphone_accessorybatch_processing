@@ -333,7 +333,7 @@ class BatchDataProcessor:
         Requirements:
         1. Divide the text into 2–3 paragraphs, each focusing on a different key feature.
         2. Start each paragraph with a short, ALL-CAPS HEADER followed by a colon.
-        3. After the colon, write the rest of the paragraph in normal sentence case.
+        3. After the colon, write the rest of the paragraph in normal sentence case. The next paragraph will start on a new line.
         4. Maintain all important product information from the original description.
         5. Improve readability, flow, and factual clarity.
         6. Use natural, descriptive language and present tense, third person.
@@ -1006,12 +1006,13 @@ or
                 if df.at[row_idx, 'Variation relation'] != 'Parent':
                     self.calculate_prices(df, row_idx)
                 else:
-                    # For parent rows, set price columns to empty
+                    # For parent rows, set price columns and unit columns to empty
                     price_columns = [
                         'Calculated Weight', 'Our Price', 'Our Price Rounded', 'MRP', 'MRP Rounded',
                         'Minimum Selling Price', 'Minimum Selling Price Rounded', 
                         'Max Selling Price', 'Max Selling Price Rounded',
-                        'Business Price', 'Business Price Rounded'
+                        'Business Price', 'Business Price Rounded',
+                        'Dimension Unit', 'Weight Unit'
                     ]
                     for col in price_columns:
                         df.at[row_idx, col] = ""
@@ -1087,9 +1088,12 @@ or
 
     def calculate_prices(self, df: pd.DataFrame, row_idx: int) -> None:
         """Calculate price columns for a row"""
+        # Safely convert value to float, return default if conversion fails
         def safe_float(value, default=0.0):
             try:
-                if pd.isna(value) or value == "" or str(value).lower() in ['nan', 'none']:
+                if value is None or value == '':
+                    return default
+                if pd.isna(value) or str(value).lower() in ['nan', 'none']:
                     return default
                 return float(str(value).replace(',', ''))
             except (ValueError, TypeError):
@@ -1099,36 +1103,51 @@ or
         gross_weight = safe_float(df.at[row_idx, "Gross weight"], 0)
         unit_price = safe_float(df.at[row_idx, "Unit Price "], 0)
         
+        print(f"DEBUG - Row {row_idx} processing:")
+        print(f"  Volume Weight: {volume_weight}")
+        print(f"  Gross Weight: {gross_weight}")
+        print(f"  Unit Price: {unit_price}")
+        
         df.at[row_idx, 'Calculated Weight'] = max(volume_weight, gross_weight)
+        print(f"  Calculated Weight: {df.at[row_idx, 'Calculated Weight']}")
         
+        # Helper function to round up to nearest 9
         def round_to_nine(price):
+            price = safe_float(price, 0)
             if price <= 0:
-                return 9.0
-            
-            str_price = f"{price:.2f}"
-            if '.' in str_price:
-                integer_part, decimal_part = str_price.split('.')
-                new_integer = integer_part[:-1] + '9'
-                return float(f"{new_integer}.{decimal_part}")
-            else:
-                return float(str(int(price))[:-1] + '9')
+                return 0
+            # Get the integer part
+            base = int(price)
+            # If already ends in 9, return as is
+            if base % 10 == 9:
+                return base
+            # Round up to next 9
+            return ((base // 10) * 10) + 9
         
-        # Calculate prices
-        our_price_calc = (unit_price * 1.3 * 90 * 5) + (df.at[row_idx, 'Calculated Weight'] * 1000 * 5) + 500
+        # Calculate Our Price with debugging
+        our_price_calc = (unit_price * 1.3 * 90 * 5) + (df.at[row_idx, 'Calculated Weight'] * 1000 * 5) + 150
         df.at[row_idx, 'Our Price'] = our_price_calc
-        df.at[row_idx, 'Our Price Rounded'] = round_to_nine(our_price_calc)
+        print(f"  Our Price calculation: ({unit_price} * 1.3 * 90 * 5) + ({df.at[row_idx, 'Calculated Weight']} * 1000 * 5) + 150 = {our_price_calc}")
+        
+        df.at[row_idx, 'Our Price Rounded'] = round_to_nine(df.at[row_idx, 'Our Price'])
+        print(f"  Our Price Rounded: {df.at[row_idx, 'Our Price Rounded']}")
         
         df.at[row_idx, 'MRP'] = df.at[row_idx, 'Our Price Rounded'] * 1.4
         df.at[row_idx, 'MRP Rounded'] = round_to_nine(df.at[row_idx, 'MRP'])
+        print(f"  MRP: {df.at[row_idx, 'MRP']} -> MRP Rounded: {df.at[row_idx, 'MRP Rounded']}")
         
         df.at[row_idx, 'Minimum Selling Price'] = df.at[row_idx, 'Our Price'] * 0.8
         df.at[row_idx, 'Minimum Selling Price Rounded'] = round_to_nine(df.at[row_idx, 'Minimum Selling Price'])
+        print(f"  Min Selling Price: {df.at[row_idx, 'Minimum Selling Price']} -> Rounded: {df.at[row_idx, 'Minimum Selling Price Rounded']}")
         
         df.at[row_idx, 'Max Selling Price'] = df.at[row_idx, 'MRP Rounded'] * 0.9
         df.at[row_idx, 'Max Selling Price Rounded'] = round_to_nine(df.at[row_idx, 'Max Selling Price'])
+        print(f"  Max Selling Price: {df.at[row_idx, 'Max Selling Price']} -> Rounded: {df.at[row_idx, 'Max Selling Price Rounded']}")
         
         df.at[row_idx, 'Business Price'] = df.at[row_idx, 'Our Price Rounded'] * 0.95
         df.at[row_idx, 'Business Price Rounded'] = round_to_nine(df.at[row_idx, 'Business Price'])
+        print(f"  Business Price: {df.at[row_idx, 'Business Price']} -> Rounded: {df.at[row_idx, 'Business Price Rounded']}")
+        print(f"DEBUG - End row {row_idx} processing\n")
 
     def update_parent_rows(self, df: pd.DataFrame) -> pd.DataFrame:
         """Update parent rows with data from their 'A' variant children"""
@@ -1168,6 +1187,14 @@ or
             for field in fields_to_copy:
                 if field in df.columns:
                     df.at[parent_idx, field] = df.at[a_idx, field]
+            
+            # Set variation type for parent from family info
+            variation_type = family_info.get('variation_type', 'Pattern')
+            df.at[parent_idx, 'Variation type'] = variation_type.upper()
+            
+            # Clear dimension and weight units for parent rows
+            df.at[parent_idx, 'Dimension Unit'] = ""
+            df.at[parent_idx, 'Weight Unit'] = ""
             
             # Remove sales attribute from titles for parent rows only
             # Strip everything after " - " from New Title
