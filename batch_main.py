@@ -214,7 +214,6 @@ class BatchDataProcessor:
         """Create batch request for bullet point generation"""
         prompt = f"""
         Product Description: "{description}"
-
         Create exactly 5 concise bullet points from this product description.
         Each bullet point should highlight a key feature or benefit that would interest customers.
 
