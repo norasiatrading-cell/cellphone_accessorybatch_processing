@@ -1100,7 +1100,7 @@ or
         
         volume_weight = safe_float(df.at[row_idx, "Volume Weight"], 0)
         gross_weight = safe_float(df.at[row_idx, "Gross weight"], 0)
-        unit_price = safe_float(df.at[row_idx, "Unit Price "], 0)
+        unit_price = safe_float(df.at[row_idx, "Unit Price"], 0)
         
         print(f"DEBUG - Row {row_idx} processing:")
         print(f"  Volume Weight: {volume_weight}")
