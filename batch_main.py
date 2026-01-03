@@ -1101,12 +1101,12 @@ or
         
         volume_weight = safe_float(df.at[row_idx, "Volume Weight"], 0)
         gross_weight = safe_float(df.at[row_idx, "Gross weight"], 0)
-        unit_price = safe_float(df.at[row_idx, "Unit Price"], 0)
+        unit_price = safe_float(df.at[row_idx, "Unit Price "], 0)
         
         print(f"DEBUG - Row {row_idx} processing:")
         print(f"  Volume Weight: {volume_weight}")
         print(f"  Gross Weight: {gross_weight}")
-        print(f"  Unit Price: {unit_price}")
+        print(f"  Unit Price : {unit_price}")
         
         df.at[row_idx, 'Calculated Weight'] = max(volume_weight, gross_weight)
         print(f"  Calculated Weight: {df.at[row_idx, 'Calculated Weight']}")
