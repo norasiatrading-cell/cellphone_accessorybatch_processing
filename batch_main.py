@@ -213,8 +213,11 @@ class BatchDataProcessor:
     def create_bullet_points_request(self, description: str, row_id: str) -> Dict:
         """Create batch request for bullet point generation"""
         prompt = f"""
+        Product Description: "{description}"
+        
         Create exactly 5 concise bullet points from this product description.
         Each bullet point should highlight a key feature or benefit that would interest customers.
+        
         Formatting Rules:
         1. Each bullet point must start with a short, descriptive header in ALL CAPS, followed by a colon.
         2. After the colon, write the rest of the text in Title Case (first letter of every word capitalized).
