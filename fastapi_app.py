@@ -201,7 +201,10 @@ def format_time(seconds):
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     """Serve the main dashboard"""
-    return templates.TemplateResponse("dashboard.html", {"request": request})
+    return templates.TemplateResponse(
+    name="dashboard.html",
+    context={"request": request}
+)
 
 @app.get("/api/status")
 async def get_status():
