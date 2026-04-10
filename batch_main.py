@@ -42,10 +42,10 @@ def load_data_file(file_path: str) -> pd.DataFrame:
     
     try:
         if file_extension == '.csv':
-            df = pd.read_csv(file_path)
+            df = pd.read_csv(file_path, keep_default_na=False)
             logger.info(f"Successfully loaded CSV file with {len(df)} rows and {len(df.columns)} columns")
         elif file_extension in ['.xlsx', '.xls']:
-            df = pd.read_excel(file_path, engine='openpyxl' if file_extension == '.xlsx' else 'xlrd')
+            df = pd.read_excel(file_path, engine='openpyxl' if file_extension == '.xlsx' else 'xlrd', keep_default_na=False)
             logger.info(f"Successfully loaded Excel file with {len(df)} rows and {len(df.columns)} columns")
         else:
             raise ValueError(f"Unsupported file format: {file_extension}. Please use .csv, .xlsx, or .xls files.")
@@ -708,25 +708,45 @@ or
         return batch_job.id
 
     def wait_for_multiple_batch_completions(self, batch_job_ids: List[str]) -> List[Dict]:
-        """Wait for multiple batch jobs to complete and return all results"""
-        logger.info(f"Waiting for {len(batch_job_ids)} batch jobs to complete...")
-        self.save_progress(f"Waiting for {len(batch_job_ids)} batch jobs")
-        
-        completed_jobs = []
+        """Wait for ALL batch jobs in parallel and return all results"""
+        import threading
+        logger.info(f"Waiting for {len(batch_job_ids)} batch jobs in PARALLEL...")
+        self.save_progress(f"Waiting for {len(batch_job_ids)} batch jobs in parallel")
+
+        results_dict = {}
+        errors_dict = {}
         start_time = time.time()
-        
+
+        def wait_for_one(idx, batch_job_id):
+            try:
+                logger.info(f"Started waiting for batch {idx + 1}/{len(batch_job_ids)}: {batch_job_id}")
+                batch_job = self.wait_for_batch_completion(batch_job_id)
+                results_dict[batch_job_id] = batch_job
+                logger.info(f"Batch {idx + 1}/{len(batch_job_ids)} completed: {batch_job_id}")
+            except Exception as e:
+                logger.error(f"Batch {idx + 1} failed: {batch_job_id} - {e}")
+                errors_dict[batch_job_id] = str(e)
+
+        # Launch all batch waits at the same time using threads
+        threads = []
         for idx, batch_job_id in enumerate(batch_job_ids):
-            logger.info(f"Processing batch {idx + 1}/{len(batch_job_ids)}: {batch_job_id}")
-            self.save_progress(f"Waiting for batch {idx + 1}/{len(batch_job_ids)}")
-            
-            batch_job = self.wait_for_batch_completion(batch_job_id)
-            completed_jobs.append(batch_job)
-            
-            logger.info(f"Batch {idx + 1}/{len(batch_job_ids)} completed")
-        
+            t = threading.Thread(target=wait_for_one, args=(idx, batch_job_id))
+            t.start()
+            threads.append(t)
+
+        # Wait for all threads to finish
+        for t in threads:
+            t.join()
+
+        if errors_dict:
+            logger.warning(f"{len(errors_dict)} batch(es) had errors: {list(errors_dict.keys())}")
+
+        # Return results in original submission order
+        completed_jobs = [results_dict[bid] for bid in batch_job_ids if bid in results_dict]
+
         elapsed_time = (time.time() - start_time) / 60
-        logger.info(f"All {len(batch_job_ids)} batches completed in {elapsed_time:.1f} minutes")
-        
+        logger.info(f"All {len(completed_jobs)} batches completed in {elapsed_time:.1f} minutes (parallel)")
+
         return completed_jobs
 
     def wait_for_batch_completion(self, batch_job_id: str) -> Dict:
@@ -902,6 +922,14 @@ or
                 else:
                     family_info['variation_type'] = "Pattern"  # Default on failure
         
+        # FIX 3: Collect all results into a buffer dict first, then write to df in bulk at the end
+        updates = {}  # { row_idx: { col: value } }
+
+        def set_val(row_idx, col, val):
+            if row_idx not in updates:
+                updates[row_idx] = {}
+            updates[row_idx][col] = val
+
         # Process row results
         for row_id, row_idx in tqdm(self.request_id_to_row_mapping.items(), desc="Processing results"):
             try:
@@ -919,72 +947,67 @@ or
                 features_key = f"features_{row_id}"
                 if features_key in batch_results and batch_results[features_key]['success']:
                     features = self.safe_json_parse(
-                        batch_results[features_key]['content'], 
-                        ["", "", "", "", ""], 
+                        batch_results[features_key]['content'],
+                        ["", "", "", "", ""],
                         "feature extraction"
                     )
                     for i, feature in enumerate(features[:5], 1):
-                        df.at[row_idx, f'Feature_{i}'] = feature
+                        set_val(row_idx, f'Feature_{i}', feature)
                 else:
                     self.failed_rows += 1
                     logger.warning(f"Failed to get features for row {row_idx}")
-                
+
                 # Process bullet points
                 bullets_key = f"bullets_{row_id}"
                 if bullets_key in batch_results and batch_results[bullets_key]['success']:
                     raw_content = batch_results[bullets_key]['content']
-                    logger.info(f"RAW bullet points response for row {row_idx}:")
-                    logger.info(f"  Content: {raw_content}")
-                    logger.info(f"  Length: {len(raw_content)} chars")
-                    
+                    logger.debug(f"RAW bullet points response for row {row_idx}:")
+                    logger.debug(f"  Content: {raw_content}")
+                    logger.debug(f"  Length: {len(raw_content)} chars")
+
                     bullets = self.safe_json_parse(
-                        raw_content, 
-                        ["", "", "", "", ""], 
+                        raw_content,
+                        ["", "", "", "", ""],
                         "bullet point generation"
                     )
-                    
-                    logger.info(f"PARSED bullet points for row {row_idx}: {bullets}")
-                    
+                    logger.debug(f"PARSED bullet points for row {row_idx}: {bullets}")
+
                     for i, bullet in enumerate(bullets[:5], 1):
-                        df.at[row_idx, f'Bullet_Point_{i}'] = bullet
+                        set_val(row_idx, f'Bullet_Point_{i}', bullet)
                 else:
                     self.failed_rows += 1
                     logger.warning(f"Failed to get bullet points for row {row_idx}")
-                
+
                 # Process attributes
                 attributes_key = f"attributes_{row_id}"
                 if attributes_key in batch_results and batch_results[attributes_key]['success']:
                     try:
                         content = batch_results[attributes_key]['content'].strip()
-                        # Clean JSON content
                         cleaned_content = self.clean_json_content(content)
                         attributes = json.loads(cleaned_content)
-                        
-                        df.at[row_idx, 'New Title'] = attributes.get('new_title', title)
-                        df.at[row_idx, 'New Title 2'] = title
-                        df.at[row_idx, 'Material'] = attributes.get('material', 'Not Specified')
-                        df.at[row_idx, 'Color'] = attributes.get('color', 'Not Specified')
-                        df.at[row_idx, 'Pattern'] = attributes.get('pattern', '')
-                        df.at[row_idx, 'Type_of_Case'] = attributes.get('type_of_case', 'Basic Case')
-                        df.at[row_idx, 'Compatible Device'] = attributes.get('compatible_device', 'Not Specified')
-                        
-                        # Validate case type
+
+                        case_type = attributes.get('type_of_case', 'Basic Case')
                         valid_case_types = ["Armband", "Basic Case", "Bumper", "Dry Bag", "Flip", "Pouch", "Square", "Wallet"]
-                        if df.at[row_idx, 'Type_of_Case'] not in valid_case_types:
-                            df.at[row_idx, 'Type_of_Case'] = "Basic Case"
-                            
+                        if case_type not in valid_case_types:
+                            case_type = "Basic Case"
+
+                        set_val(row_idx, 'New Title', attributes.get('new_title', title))
+                        set_val(row_idx, 'New Title 2', title)
+                        set_val(row_idx, 'Material', attributes.get('material', 'Not Specified'))
+                        set_val(row_idx, 'Color', attributes.get('color', 'Not Specified'))
+                        set_val(row_idx, 'Pattern', attributes.get('pattern', ''))
+                        set_val(row_idx, 'Type_of_Case', case_type)
+                        set_val(row_idx, 'Compatible Device', attributes.get('compatible_device', 'Not Specified'))
+
                     except Exception as e:
                         logger.error(f"Error parsing attributes for row {row_idx}: {e}")
-                        df.at[row_idx, 'Material'] = "Error"
-                        df.at[row_idx, 'Color'] = "Error"
-                        df.at[row_idx, 'Pattern'] = "Error"
-                        df.at[row_idx, 'Type_of_Case'] = "Error"
-                        df.at[row_idx, 'Compatible Device'] = "Error"
+                        for col in ['Material', 'Color', 'Pattern', 'Type_of_Case', 'Compatible Device']:
+                            set_val(row_idx, col, "Error")
                         self.failed_rows += 1
                 else:
                     self.failed_rows += 1
                     logger.warning(f"Failed to get attributes for row {row_idx}")
-                
+
                 # Process SEO description
                 seo_key = f"seo_{row_id}"
                 if seo_key in batch_results and batch_results[seo_key]['success']:
@@ -993,30 +1016,29 @@ or
                         content = content[1:-1]
                     if len(content) > 1950:
                         content = content[:1947] + "..."
-                    df.at[row_idx, 'New Description（without HTML format）'] = content or "No description available."
+                    set_val(row_idx, 'New Description（without HTML format）', content or "No description available.")
                 else:
-                    df.at[row_idx, 'New Description（without HTML format）'] = "No description available."
+                    set_val(row_idx, 'New Description（without HTML format）', "No description available.")
                     self.failed_rows += 1
                     logger.warning(f"Failed to get SEO description for row {row_idx}")
-                
-                # Apply family variation logic
+
+                # Apply family variation logic (still uses df.at internally — small, acceptable)
                 self.apply_family_variation_logic(df, row_idx)
-                
-                # Process price calculations (skip for parent rows)
+
+                # Process price calculations
                 if df.at[row_idx, 'Variation relation'] != 'Parent':
                     self.calculate_prices(df, row_idx)
                 else:
-                    # For parent rows, set price columns and unit columns to empty
                     price_columns = [
                         'Calculated Weight', 'Our Price', 'Our Price Rounded', 'MRP', 'MRP Rounded',
-                        'Minimum Selling Price', 'Minimum Selling Price Rounded', 
+                        'Minimum Selling Price', 'Minimum Selling Price Rounded',
                         'Max Selling Price', 'Max Selling Price Rounded',
                         'Business Price', 'Business Price Rounded',
                         'Dimension Unit', 'Weight Unit'
                     ]
                     for col in price_columns:
-                        df.at[row_idx, col] = ""
-                
+                        set_val(row_idx, col, "")
+
                 # Process image URLs
                 for i in range(1, 9):
                     original_candidates = [f"Pic {i}", f"Pic{i}", f"pic {i}", f"pic{i}"]
@@ -1025,9 +1047,8 @@ or
                         if candidate in df.columns and pd.notna(df.at[row_idx, candidate]):
                             old_url = str(df.at[row_idx, candidate])
                             break
-                    
+
                     if old_url and old_url != "nan":
-                        # Transform URL
                         new_url = old_url.replace("https://ae01.alicdn.com/kf/", "https://m.media-amazon.com/images/I/")
                         if ".jpg" in new_url:
                             new_url = new_url.replace(".jpg", ".jpg")
@@ -1037,15 +1058,22 @@ or
                             new_url = new_url.replace(".webp", ".jpg")
                         else:
                             new_url += ".jpg"
-                        df.at[row_idx, f"Image {i}"] = new_url
+                        set_val(row_idx, f"Image {i}", new_url)
                     else:
-                        df.at[row_idx, f"Image {i}"] = ""
-                
+                        set_val(row_idx, f"Image {i}", "")
+
                 self.successful_rows += 1
-                
+
             except Exception as e:
                 logger.error(f"Error processing row {row_idx}: {e}")
                 self.failed_rows += 1
+
+        # FIX 3: Write all collected updates to dataframe in one bulk operation
+        logger.info(f"Writing {len(updates)} rows of results to dataframe in bulk...")
+        for row_idx, col_vals in updates.items():
+            for col, val in col_vals.items():
+                df.at[row_idx, col] = val
+        logger.info("Bulk write complete.")
         
         return df
 
@@ -1079,6 +1107,10 @@ or
         
         # Update Color or Pattern column based on variation type
         sales_attr = str(df.at[row_idx, 'Sales attribute 1']).strip()
+        # Fix B: block nan, none, or empty string from being written into Color/Pattern
+        if sales_attr.lower() in ['nan', 'none', '']:
+            sales_attr = ''
+            logger.debug(f"Skipping empty/nan sales_attr for {sku}")
         if variation_type == "Color" and sales_attr:
             df.at[row_idx, 'Color'] = sales_attr
             logger.debug(f"Updated Color for {sku}: {sales_attr}")
@@ -1103,13 +1135,10 @@ or
         gross_weight = safe_float(df.at[row_idx, "Gross weight"], 0)
         unit_price = safe_float(df.at[row_idx, "Unit Price "], 0)
         
-        print(f"DEBUG - Row {row_idx} processing:")
-        print(f"  Volume Weight: {volume_weight}")
-        print(f"  Gross Weight: {gross_weight}")
-        print(f"  Unit Price : {unit_price}")
+        logger.debug(f"Row {row_idx} - Volume Weight: {volume_weight}, Gross Weight: {gross_weight}, Unit Price: {unit_price}")
         
         df.at[row_idx, 'Calculated Weight'] = max(volume_weight, gross_weight)
-        print(f"  Calculated Weight: {df.at[row_idx, 'Calculated Weight']}")
+        logger.debug(f"Row {row_idx} - Calculated Weight: {df.at[row_idx, 'Calculated Weight']}")
         
         # Helper function to round up to nearest 9
         def round_to_nine(price):
@@ -1124,30 +1153,29 @@ or
             # Round up to next 9
             return ((base // 10) * 10) + 9
         
-        # Calculate Our Price with debugging
+        # Calculate Our Price
         our_price_calc = (unit_price * 1.3 * 90 * 5) + (df.at[row_idx, 'Calculated Weight'] * 1000 * 5) + 150
         df.at[row_idx, 'Our Price'] = our_price_calc
-        print(f"  Our Price calculation: ({unit_price} * 1.3 * 90 * 5) + ({df.at[row_idx, 'Calculated Weight']} * 1000 * 5) + 150 = {our_price_calc}")
+        logger.debug(f"Row {row_idx} - Our Price: {our_price_calc}")
         
         df.at[row_idx, 'Our Price Rounded'] = round_to_nine(df.at[row_idx, 'Our Price'])
-        print(f"  Our Price Rounded: {df.at[row_idx, 'Our Price Rounded']}")
+        logger.debug(f"Row {row_idx} - Our Price Rounded: {df.at[row_idx, 'Our Price Rounded']}")
         
         df.at[row_idx, 'MRP'] = df.at[row_idx, 'Our Price Rounded'] * 1.4
         df.at[row_idx, 'MRP Rounded'] = round_to_nine(df.at[row_idx, 'MRP'])
-        print(f"  MRP: {df.at[row_idx, 'MRP']} -> MRP Rounded: {df.at[row_idx, 'MRP Rounded']}")
+        logger.debug(f"Row {row_idx} - MRP: {df.at[row_idx, 'MRP']} -> MRP Rounded: {df.at[row_idx, 'MRP Rounded']}")
         
         df.at[row_idx, 'Minimum Selling Price'] = df.at[row_idx, 'Our Price'] * 0.8
         df.at[row_idx, 'Minimum Selling Price Rounded'] = round_to_nine(df.at[row_idx, 'Minimum Selling Price'])
-        print(f"  Min Selling Price: {df.at[row_idx, 'Minimum Selling Price']} -> Rounded: {df.at[row_idx, 'Minimum Selling Price Rounded']}")
+        logger.debug(f"Row {row_idx} - Min Selling Price: {df.at[row_idx, 'Minimum Selling Price']} -> Rounded: {df.at[row_idx, 'Minimum Selling Price Rounded']}")
         
         df.at[row_idx, 'Max Selling Price'] = df.at[row_idx, 'MRP Rounded'] * 0.9
         df.at[row_idx, 'Max Selling Price Rounded'] = round_to_nine(df.at[row_idx, 'Max Selling Price'])
-        print(f"  Max Selling Price: {df.at[row_idx, 'Max Selling Price']} -> Rounded: {df.at[row_idx, 'Max Selling Price Rounded']}")
+        logger.debug(f"Row {row_idx} - Max Selling Price: {df.at[row_idx, 'Max Selling Price']} -> Rounded: {df.at[row_idx, 'Max Selling Price Rounded']}")
         
         df.at[row_idx, 'Business Price'] = df.at[row_idx, 'Our Price Rounded'] * 0.95
         df.at[row_idx, 'Business Price Rounded'] = round_to_nine(df.at[row_idx, 'Business Price'])
-        print(f"  Business Price: {df.at[row_idx, 'Business Price']} -> Rounded: {df.at[row_idx, 'Business Price Rounded']}")
-        print(f"DEBUG - End row {row_idx} processing\n")
+        logger.debug(f"Row {row_idx} - Business Price: {df.at[row_idx, 'Business Price']} -> Rounded: {df.at[row_idx, 'Business Price Rounded']}")
 
     def update_parent_rows(self, df: pd.DataFrame) -> pd.DataFrame:
         """Update parent rows with data from their 'A' variant children"""
