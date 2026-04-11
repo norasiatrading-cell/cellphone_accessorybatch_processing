@@ -1,17 +1,16 @@
 from groq import Groq
 from typing import List, Dict, Optional
 import pandas as pd
-import asyncio
 import json
 import os
 import logging
 import re
 import time
-import signal
 import sys
-import shutil
+import threading
 from datetime import datetime
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import uuid
 from tqdm import tqdm
 from dotenv import load_dotenv
@@ -32,6 +31,246 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Silence Groq/httpx library's internal HTTP request logs (the noisy "HTTP Request: GET https://api.groq.com" lines)
+# WARNING and ERROR from these libraries will still show
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("groq").setLevel(logging.WARNING)
+
+# ─────────────────────────────────────────────
+# LIVE DASHBOARD SERVER
+# ─────────────────────────────────────────────
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="5">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Batch Processing Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', sans-serif; background: #0f1117; color: #e0e0e0; padding: 24px; }
+  h1 { font-size: 22px; color: #fff; margin-bottom: 6px; }
+  .subtitle { font-size: 13px; color: #888; margin-bottom: 24px; }
+  .card { background: #1a1d27; border-radius: 12px; padding: 20px; margin-bottom: 16px; border: 1px solid #2a2d3a; }
+  .card h2 { font-size: 13px; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 14px; }
+  .status-badge { display: inline-block; padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 600; margin-bottom: 16px; }
+  .status-running  { background: #1a3a1a; color: #4caf50; border: 1px solid #4caf50; }
+  .status-waiting  { background: #1a2a3a; color: #2196f3; border: 1px solid #2196f3; }
+  .status-done     { background: #2a1a3a; color: #9c27b0; border: 1px solid #9c27b0; }
+  .status-error    { background: #3a1a1a; color: #f44336; border: 1px solid #f44336; }
+  .status-init     { background: #2a2a1a; color: #ff9800; border: 1px solid #ff9800; }
+  .progress-bar-bg { background: #2a2d3a; border-radius: 8px; height: 18px; overflow: hidden; margin-bottom: 10px; }
+  .progress-bar-fill { height: 100%; border-radius: 8px; background: linear-gradient(90deg, #4caf50, #8bc34a); transition: width 0.5s ease; }
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+  .stat-box { background: #12141e; border-radius: 8px; padding: 14px; text-align: center; border: 1px solid #2a2d3a; }
+  .stat-val { font-size: 26px; font-weight: 700; color: #fff; }
+  .stat-label { font-size: 11px; color: #888; margin-top: 4px; text-transform: uppercase; }
+  .stat-val.green { color: #4caf50; }
+  .stat-val.red   { color: #f44336; }
+  .stat-val.blue  { color: #2196f3; }
+  .stat-val.orange { color: #ff9800; }
+  .log-box { background: #0a0c12; border-radius: 8px; padding: 14px; max-height: 320px; overflow-y: auto; font-family: monospace; font-size: 12px; line-height: 1.7; border: 1px solid #2a2d3a; }
+  .log-info    { color: #90caf9; }
+  .log-warning { color: #ffb74d; }
+  .log-error   { color: #ef9a9a; }
+  .log-debug   { color: #666; }
+  .pct-text { font-size: 13px; color: #aaa; margin-bottom: 16px; }
+  .refresh-note { font-size: 11px; color: #555; text-align: right; margin-top: 8px; }
+  .eta-row { display: flex; gap: 16px; margin-bottom: 8px; flex-wrap: wrap; }
+  .eta-item { font-size: 13px; color: #aaa; }
+  .eta-item span { color: #fff; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>🚀 Batch Processing Dashboard</h1>
+<div class="subtitle">Auto-refreshes every 5 seconds</div>
+
+<div class="card">
+  <h2>Current Status</h2>
+  <div class="status-badge {STATUS_CLASS}">{STATUS}</div>
+  <div class="progress-bar-bg"><div class="progress-bar-fill" style="width:{PCT}%"></div></div>
+  <div class="pct-text">{PCT}% complete — {ROWS_DONE} of {TOTAL_ROWS} rows</div>
+  <div class="eta-row">
+    <div class="eta-item">⏱ Elapsed: <span>{ELAPSED}</span></div>
+    <div class="eta-item">⏳ Est. Remaining: <span>{ETA}</span></div>
+    <div class="eta-item">🕐 Last Updated: <span>{LAST_UPDATED}</span></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Statistics</h2>
+  <div class="stats-grid">
+    <div class="stat-box"><div class="stat-val blue">{TOTAL_ROWS}</div><div class="stat-label">Total Rows</div></div>
+    <div class="stat-box"><div class="stat-val green">{ROWS_DONE}</div><div class="stat-label">Processed</div></div>
+    <div class="stat-box"><div class="stat-val red">{FAILED}</div><div class="stat-label">Failed</div></div>
+    <div class="stat-box"><div class="stat-val orange">{PCT}%</div><div class="stat-label">Progress</div></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Live Logs (last 30 lines)</h2>
+  <div class="log-box">{LOGS}</div>
+  <div class="refresh-note">Page auto-refreshes every 5 seconds</div>
+</div>
+</body>
+</html>"""
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    """Serves the live dashboard page"""
+
+    def do_GET(self):
+        if self.path in ['/', '/status']:
+            self._serve_dashboard()
+        elif self.path == '/api/status':
+            self._serve_json()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _serve_dashboard(self):
+        html = self._build_html()
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(html.encode('utf-8'))
+
+    def _serve_json(self):
+        data = self._read_status()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode('utf-8'))
+
+    def _read_status(self):
+        try:
+            with open('batch_results.json', 'r') as f:
+                return json.load(f)
+        except Exception:
+            return {"status": "Starting up...", "total_rows": 0, "successful_rows": 0, "failed_rows": 0, "start_time": None, "last_updated": None}
+
+    def _read_logs(self):
+        try:
+            with open('batch_processing.log', 'r') as f:
+                lines = f.readlines()
+            return lines[-30:] if len(lines) > 30 else lines
+        except Exception:
+            return []
+
+    def _build_html(self):
+        data = self._read_status()
+        log_lines = self._read_logs()
+
+        status     = data.get('status', 'Starting up...')
+        total_rows = data.get('total_rows', 0)
+        rows_done  = data.get('successful_rows', 0)
+        failed     = data.get('failed_rows', 0)
+        start_time = data.get('start_time')
+        last_updated = data.get('last_updated', '')
+
+        # Percentage
+        pct = round((rows_done / total_rows * 100), 1) if total_rows > 0 else 0
+
+        # Elapsed time
+        elapsed_str = '—'
+        eta_str = '—'
+        if start_time:
+            try:
+                start_dt = datetime.fromisoformat(start_time)
+                elapsed_secs = (datetime.now() - start_dt).total_seconds()
+                elapsed_str = self._fmt_duration(elapsed_secs)
+
+                # ETA calculation
+                if rows_done > 0 and total_rows > rows_done:
+                    rate = rows_done / elapsed_secs  # rows per second
+                    remaining = (total_rows - rows_done) / rate
+                    eta_str = self._fmt_duration(remaining)
+                elif total_rows > 0 and rows_done >= total_rows:
+                    eta_str = 'Done!'
+            except Exception:
+                pass
+
+        # Last updated time only (not full ISO)
+        try:
+            lu = datetime.fromisoformat(last_updated).strftime('%H:%M:%S') if last_updated else '—'
+        except Exception:
+            lu = '—'
+
+        # Status badge class
+        sl = status.lower()
+        if any(x in sl for x in ['complete', 'done', 'saved']):
+            status_class = 'status-done'
+        elif any(x in sl for x in ['error', 'fail']):
+            status_class = 'status-error'
+        elif any(x in sl for x in ['waiting', 'submitted', 'downloading']):
+            status_class = 'status-waiting'
+        elif any(x in sl for x in ['initializ', 'starting', 'preparing', 'loading']):
+            status_class = 'status-init'
+        else:
+            status_class = 'status-running'
+
+        # Build log HTML
+        log_html = ''
+        for line in log_lines:
+            line = line.strip()
+            if not line:
+                continue
+            if ' - ERROR - ' in line:
+                log_html += f'<div class="log-error">{self._escape(line)}</div>'
+            elif ' - WARNING - ' in line:
+                log_html += f'<div class="log-warning">{self._escape(line)}</div>'
+            elif ' - DEBUG - ' in line:
+                log_html += f'<div class="log-debug">{self._escape(line)}</div>'
+            else:
+                log_html += f'<div class="log-info">{self._escape(line)}</div>'
+
+        if not log_html:
+            log_html = '<div class="log-debug">No logs yet — processing will appear here shortly...</div>'
+
+        return DASHBOARD_HTML.replace('{STATUS}', self._escape(status)) \
+                              .replace('{STATUS_CLASS}', status_class) \
+                              .replace('{PCT}', str(pct)) \
+                              .replace('{ROWS_DONE}', f'{rows_done:,}') \
+                              .replace('{TOTAL_ROWS}', f'{total_rows:,}') \
+                              .replace('{FAILED}', str(failed)) \
+                              .replace('{ELAPSED}', elapsed_str) \
+                              .replace('{ETA}', eta_str) \
+                              .replace('{LAST_UPDATED}', lu) \
+                              .replace('{LOGS}', log_html)
+
+    def _fmt_duration(self, secs):
+        secs = int(secs)
+        if secs < 60:
+            return f'{secs}s'
+        elif secs < 3600:
+            return f'{secs // 60}m {secs % 60}s'
+        else:
+            h = secs // 3600
+            m = (secs % 3600) // 60
+            return f'{h}h {m}m'
+
+    def _escape(self, text):
+        return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+    def log_message(self, format, *args):
+        pass  # suppress default HTTP server logs — keep our log clean
+
+
+def start_dashboard_server(port: int = 8080):
+    """Start the dashboard server in a background thread"""
+    try:
+        server = HTTPServer(('0.0.0.0', port), DashboardHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        logger.info(f"📊 Live dashboard started at http://0.0.0.0:{port}")
+        return server
+    except Exception as e:
+        logger.warning(f"Could not start dashboard server on port {port}: {e}")
+        return None
+
 
 def load_data_file(file_path: str) -> pd.DataFrame:
     """Load data from CSV or Excel file based on file extension"""
@@ -97,6 +336,9 @@ class BatchDataProcessor:
         # Batch processing
         self.batch_requests = []
         self.request_id_to_row_mapping = {}
+
+        # Fix 6: Failed rows report — tracks which rows failed and why
+        self.failed_rows_report = []
     
     def save_progress(self, status: str, output_file: str = None, estimated_rows_completed: int = None):
         """Save current progress to JSON file for real-time monitoring"""
@@ -585,26 +827,40 @@ or
         regular_rows = df[df['Variation relation'] != 'Parent']
         self.regular_rows_count = len(regular_rows)  # Store count of rows being processed
         
+        skipped_rows = 0
         for idx, row in regular_rows.iterrows():
-            row_id = str(uuid.uuid4())
+            title = str(row.get('Title', '')).strip()
+            description = str(row.get('Description（without HTML format）', '')).strip()
+            sales_attribute = str(row.get('Sales attribute 1', '')).strip()
+
+            # Fix 4: Skip rows with empty or nan description — no point sending to Groq
+            if not description or description.lower() in ['nan', 'none', '']:
+                logger.warning(f"Skipping row {idx} (SKU: {row.get('SKU', 'unknown')}) — empty description")
+                skipped_rows += 1
+                continue
+
+            # Use SKU-based deterministic row_id instead of random UUID
+            # This ensures checkpoint resume produces identical row_ids
+            # so results from checkpoint correctly match back to rows
+            sku_val = str(row.get('SKU', '')).strip()
+            row_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{sku_val}_{idx}"))
             self.request_id_to_row_mapping[row_id] = idx
-            
-            title = str(row.get('Title', ''))
-            description = str(row.get('Description（without HTML format）', ''))
-            sales_attribute = str(row.get('Sales attribute 1', ''))
-            
+
             # Clean title
             title = title.replace("Case ", "")
             if title.startswith("For"):
                 title = title.replace("For", "Case For", 1).strip()
             elif not title.lower().startswith("case for"):
                 title = "Case For " + title.strip()
-            
+
             # Create 4 requests per row
             self.batch_requests.append(self.create_feature_extraction_request(description, row_id))
             self.batch_requests.append(self.create_bullet_points_request(description, row_id))
             self.batch_requests.append(self.create_attributes_request(title, description, sales_attribute, row_id))
             self.batch_requests.append(self.create_seo_description_request(description, title, row_id))
+
+        if skipped_rows > 0:
+            logger.warning(f"Skipped {skipped_rows} rows due to empty descriptions")
         
         # Add variation type requests for multi-variant families
         for base_sku, family_info in self.families.items():
@@ -617,126 +873,147 @@ or
         logger.info(f"Prepared {self.total_batch_requests} batch requests for {len(regular_rows)} rows")
 
     def submit_batch_jobs_in_chunks(self) -> List[str]:
-        """Submit batch requests in chunks to respect API limits"""
+        """Submit batch requests in chunks with split-and-retry on failure"""
         total_requests = len(self.batch_requests)
-        
+
         if total_requests <= self.max_requests_per_batch:
-            # Single batch - use original method
             logger.info(f"Submitting single batch with {total_requests} requests")
-            batch_id = self.submit_batch_job()
-            return [batch_id]
-        
-        # Split into multiple batches
+            # Use split-retry even for single batch for safety
+            ids = self.submit_single_batch_chunk(self.batch_requests, 0)
+            return ids
+
         num_batches = (total_requests + self.max_requests_per_batch - 1) // self.max_requests_per_batch
         logger.info(f"Splitting {total_requests} requests into {num_batches} batches (max {self.max_requests_per_batch} per batch)")
-        
-        batch_ids = []
+
+        all_batch_ids = []
         for batch_num in range(num_batches):
             start_idx = batch_num * self.max_requests_per_batch
             end_idx = min((batch_num + 1) * self.max_requests_per_batch, total_requests)
             chunk = self.batch_requests[start_idx:end_idx]
-            
+
             logger.info(f"Submitting batch {batch_num + 1}/{num_batches} with {len(chunk)} requests")
-            batch_id = self.submit_single_batch_chunk(chunk, batch_num)
-            batch_ids.append(batch_id)
-            
-            # Small delay between submissions
+            # Returns list of IDs (may be multiple if split occurred)
+            ids = self.submit_single_batch_chunk(chunk, batch_num)
+            all_batch_ids.extend(ids)
+
             if batch_num < num_batches - 1:
                 time.sleep(1)
-        
-        logger.info(f"Successfully submitted {num_batches} batch jobs")
-        return batch_ids
+
+        logger.info(f"Successfully submitted {len(all_batch_ids)} batch job(s) total")
+        return all_batch_ids
     
-    def submit_single_batch_chunk(self, requests: List[Dict], batch_num: int) -> str:
-        """Submit a single batch chunk to Groq"""
-        # Create batch file
-        batch_file_path = f"batch_requests_chunk_{batch_num}.jsonl"
+    def upload_and_create_batch(self, requests: List[Dict], label: str) -> str:
+        """Upload a list of requests as a batch file and return the batch job ID"""
+        batch_file_path = f"batch_requests_{label}.jsonl"
         with open(batch_file_path, 'w') as f:
             for request in requests:
                 f.write(json.dumps(request) + '\n')
-        
-        # Upload batch file
+
         with open(batch_file_path, 'rb') as f:
-            batch_file = self.client.files.create(
-                file=f,
-                purpose='batch'
-            )
-        
-        # Create batch job
+            batch_file = self.client.files.create(file=f, purpose='batch')
+
         batch_job = self.client.batches.create(
             input_file_id=batch_file.id,
             endpoint="/v1/chat/completions",
             completion_window="24h"
         )
-        
-        logger.info(f"Batch chunk {batch_num} submitted with ID: {batch_job.id}")
-        
-        # Clean up local file
+
         os.remove(batch_file_path)
-        
+        logger.info(f"Batch [{label}] submitted with ID: {batch_job.id} ({len(requests)} requests)")
         return batch_job.id
 
-    def submit_batch_job(self) -> str:
-        """Submit batch job to Groq"""
-        logger.info("Submitting batch job to Groq...")
-        
-        # Create batch file
-        batch_file_path = "batch_requests.jsonl"
-        with open(batch_file_path, 'w') as f:
-            for request in self.batch_requests:
-                f.write(json.dumps(request) + '\n')
-        
-        # Upload batch file
-        with open(batch_file_path, 'rb') as f:
-            batch_file = self.client.files.create(
-                file=f,
-                purpose='batch'
-            )
-        
-        # Create batch job
-        batch_job = self.client.batches.create(
-            input_file_id=batch_file.id,
-            endpoint="/v1/chat/completions",
-            completion_window="24h"
-        )
-        
-        logger.info(f"Batch job submitted with ID: {batch_job.id}")
-        
-        # Clean up local file
-        os.remove(batch_file_path)
-        
-        return batch_job.id
+    def submit_single_batch_chunk(self, requests: List[Dict], batch_num: int) -> List[str]:
+        """Submit a batch chunk with automatic split-and-retry on failure.
+        Returns a list of batch job IDs (may be multiple if splitting occurred)."""
+        MIN_BATCH_SIZE = 50  # minimum requests before giving up on splitting
+
+        def submit_with_split(reqs: List[Dict], label: str, depth: int = 0) -> List[str]:
+            indent = "  " * depth
+            try:
+                batch_id = self.upload_and_create_batch(reqs, label)
+                return [batch_id]
+            except Exception as e:
+                logger.warning(f"{indent}Batch [{label}] failed to submit: {e}")
+
+                if len(reqs) <= MIN_BATCH_SIZE:
+                    logger.error(f"{indent}Batch [{label}] cannot be split further ({len(reqs)} requests). "
+                                 f"These rows will have empty columns in output.")
+                    # Track permanently failed request IDs
+                    for req in reqs:
+                        cid = req.get('custom_id', '')
+                        logger.error(f"{indent}  Permanently failed request: {cid}")
+                    return []  # no batch ID — these rows are lost
+
+                # Split in half and retry each half
+                half = len(reqs) // 2
+                left  = reqs[:half]
+                right = reqs[half:]
+                logger.info(f"{indent}Splitting [{label}] into two halves of {len(left)} and {len(right)} — retrying...")
+                time.sleep(3)  # brief pause before retry
+
+                left_ids  = submit_with_split(left,  f"{label}_L", depth + 1)
+                right_ids = submit_with_split(right, f"{label}_R", depth + 1)
+                return left_ids + right_ids
+
+        return submit_with_split(requests, f"chunk{batch_num}")
+
+
 
     def wait_for_multiple_batch_completions(self, batch_job_ids: List[str]) -> List[Dict]:
-        """Wait for ALL batch jobs in parallel and return all results"""
+        """Wait for batch jobs in groups to avoid hitting Groq concurrent job limits"""
         import threading
-        logger.info(f"Waiting for {len(batch_job_ids)} batch jobs in PARALLEL...")
-        self.save_progress(f"Waiting for {len(batch_job_ids)} batch jobs in parallel")
+
+        MAX_CONCURRENT = 5  # max batches running in parallel at same time — safe for Groq
+        total = len(batch_job_ids)
+        logger.info(f"Waiting for {total} batch jobs in groups of {MAX_CONCURRENT}...")
+        self.save_progress(f"Waiting for {total} batch jobs (groups of {MAX_CONCURRENT})")
 
         results_dict = {}
         errors_dict = {}
+        completed_count = [0]  # mutable list so threads can update it
         start_time = time.time()
 
         def wait_for_one(idx, batch_job_id):
             try:
-                logger.info(f"Started waiting for batch {idx + 1}/{len(batch_job_ids)}: {batch_job_id}")
+                logger.info(f"Waiting for batch {idx + 1}/{total}: {batch_job_id}")
                 batch_job = self.wait_for_batch_completion(batch_job_id)
                 results_dict[batch_job_id] = batch_job
-                logger.info(f"Batch {idx + 1}/{len(batch_job_ids)} completed: {batch_job_id}")
+                completed_count[0] += 1
+                pct = round(completed_count[0] / total * 100, 1)
+                logger.info(f"Batch {idx + 1}/{total} completed: {batch_job_id} — overall {pct}% batches done")
+                self.save_progress(f"Batches completed: {completed_count[0]}/{total} ({pct}%)")
             except Exception as e:
-                logger.error(f"Batch {idx + 1} failed: {batch_job_id} - {e}")
+                logger.error(f"Batch {idx + 1}/{total} failed: {batch_job_id} - {e}")
                 errors_dict[batch_job_id] = str(e)
+                completed_count[0] += 1
 
-        # Launch all batch waits at the same time using threads
-        threads = []
-        for idx, batch_job_id in enumerate(batch_job_ids):
-            t = threading.Thread(target=wait_for_one, args=(idx, batch_job_id))
-            t.start()
-            threads.append(t)
+        # Process in groups of MAX_CONCURRENT to respect Groq concurrent job limits
+        num_groups = (total + MAX_CONCURRENT - 1) // MAX_CONCURRENT
+        for group_num in range(num_groups):
+            start_idx = group_num * MAX_CONCURRENT
+            end_idx = min(start_idx + MAX_CONCURRENT, total)
+            group = batch_job_ids[start_idx:end_idx]
 
-        # Wait for all threads to finish
-        for t in threads:
-            t.join()
+            logger.info(f"Starting group {group_num + 1}/{num_groups} — batches {start_idx + 1} to {end_idx}")
+            self.save_progress(f"Processing group {group_num + 1}/{num_groups}")
+
+            # Launch all threads in this group simultaneously
+            threads = []
+            for idx, batch_job_id in enumerate(group):
+                t = threading.Thread(target=wait_for_one, args=(start_idx + idx, batch_job_id))
+                t.start()
+                threads.append(t)
+
+            # Wait for entire group to finish before moving to next group
+            for t in threads:
+                t.join()
+
+            logger.info(f"Group {group_num + 1}/{num_groups} done.")
+
+            # Small breathing gap between groups to avoid rate limit spikes
+            if group_num < num_groups - 1:
+                logger.info("Waiting 2 seconds before next group...")
+                time.sleep(2)
 
         if errors_dict:
             logger.warning(f"{len(errors_dict)} batch(es) had errors: {list(errors_dict.keys())}")
@@ -745,7 +1022,7 @@ or
         completed_jobs = [results_dict[bid] for bid in batch_job_ids if bid in results_dict]
 
         elapsed_time = (time.time() - start_time) / 60
-        logger.info(f"All {len(completed_jobs)} batches completed in {elapsed_time:.1f} minutes (parallel)")
+        logger.info(f"All {len(completed_jobs)}/{total} batches completed in {elapsed_time:.1f} minutes")
 
         return completed_jobs
 
@@ -956,6 +1233,7 @@ or
                 else:
                     self.failed_rows += 1
                     logger.warning(f"Failed to get features for row {row_idx}")
+                    self.failed_rows_report.append({"row": row_idx, "sku": str(df.at[row_idx, "SKU"]) if "SKU" in df.columns else "unknown", "reason": "features request failed"})
 
                 # Process bullet points
                 bullets_key = f"bullets_{row_id}"
@@ -977,6 +1255,7 @@ or
                 else:
                     self.failed_rows += 1
                     logger.warning(f"Failed to get bullet points for row {row_idx}")
+                    self.failed_rows_report.append({"row": row_idx, "sku": str(df.at[row_idx, "SKU"]) if "SKU" in df.columns else "unknown", "reason": "bullet points request failed"})
 
                 # Process attributes
                 attributes_key = f"attributes_{row_id}"
@@ -1004,9 +1283,11 @@ or
                         for col in ['Material', 'Color', 'Pattern', 'Type_of_Case', 'Compatible Device']:
                             set_val(row_idx, col, "Error")
                         self.failed_rows += 1
+                        self.failed_rows_report.append({"row": row_idx, "sku": str(df.at[row_idx, "SKU"]) if "SKU" in df.columns else "unknown", "reason": f"attributes parse error: {e}"})
                 else:
                     self.failed_rows += 1
                     logger.warning(f"Failed to get attributes for row {row_idx}")
+                    self.failed_rows_report.append({"row": row_idx, "sku": str(df.at[row_idx, "SKU"]) if "SKU" in df.columns else "unknown", "reason": "attributes request failed"})
 
                 # Process SEO description
                 seo_key = f"seo_{row_id}"
@@ -1021,9 +1302,7 @@ or
                     set_val(row_idx, 'New Description（without HTML format）', "No description available.")
                     self.failed_rows += 1
                     logger.warning(f"Failed to get SEO description for row {row_idx}")
-
-                # Apply family variation logic (still uses df.at internally — small, acceptable)
-                self.apply_family_variation_logic(df, row_idx)
+                    self.failed_rows_report.append({"row": row_idx, "sku": str(df.at[row_idx, "SKU"]) if "SKU" in df.columns else "unknown", "reason": "SEO description request failed"})
 
                 # Process price calculations
                 if df.at[row_idx, 'Variation relation'] != 'Parent':
@@ -1074,7 +1353,17 @@ or
             for col, val in col_vals.items():
                 df.at[row_idx, col] = val
         logger.info("Bulk write complete.")
-        
+
+        # Apply family variation logic AFTER bulk write — so sales_attr correctly
+        # overwrites Groq's pattern/color value instead of being overwritten by it
+        logger.info("Applying family variation logic...")
+        for row_id, row_idx in self.request_id_to_row_mapping.items():
+            try:
+                self.apply_family_variation_logic(df, row_idx)
+            except Exception as e:
+                logger.error(f"Error applying variation logic for row {row_idx}: {e}")
+        logger.info("Family variation logic applied.")
+
         return df
 
     def apply_family_variation_logic(self, df: pd.DataFrame, row_idx: int) -> None:
@@ -1239,86 +1528,105 @@ or
         
         return df
 
-    async def process_file(self, input_file: str, output_file: str) -> None:
+    def process_file(self, input_file: str, output_file: str) -> None:
         """Main function to process the entire CSV/Excel file using batch API"""
         logger.info(f"Starting batch processing of {input_file}")
-        
+
         self.start_time = time.time()
         self.successful_rows = 0
         self.failed_rows = 0
-        
-        # Save initial progress
+
         self.save_progress("Initializing")
-        
+
         # Load data
         try:
             df = load_data_file(input_file)
         except Exception as e:
             logger.error(f"Error reading file: {e}")
             raise
-        
+
         # Apply row limits if specified
         if self.max_rows and len(df) > self.max_rows:
             logger.info(f"Limiting processing to {self.max_rows} rows (original: {len(df)})")
             df = df.head(self.max_rows)
-        
+
         # Process variations
         df = self.process_variations(df)
         self.total_rows = len(df)
         self.save_progress("Processing variations")
-        
-        # Prepare batch requests
+
+        # Prepare batch requests (needed for row mapping even on resume)
         self.prepare_batch_requests(df)
         self.save_progress("Preparing batch requests")
-        
-        # Submit batch jobs (chunked if necessary)
-        batch_job_ids = self.submit_batch_jobs_in_chunks()
-        self.save_progress(f"{len(batch_job_ids)} batch job(s) submitted, waiting for completion")
-        
-        # Wait for all batches to complete
-        if len(batch_job_ids) == 1:
-            # Single batch - use original method
-            batch_job = self.wait_for_batch_completion(batch_job_ids[0])
-            completed_jobs = [batch_job]
+
+        # FIX 3: CHECKPOINT — check if batch_results.json already exists from a previous run
+        checkpoint_file = "batch_results_checkpoint.json"
+        if os.path.exists(checkpoint_file):
+            logger.info(f"CHECKPOINT FOUND: {checkpoint_file} — skipping Groq submission, resuming from saved results")
+            print(f"\n⚡ Checkpoint detected! Resuming from previous results — no Groq requests will be made.")
+            with open(checkpoint_file, 'r') as f:
+                batch_results = json.load(f)
+            logger.info(f"Loaded {len(batch_results)} results from checkpoint")
         else:
-            # Multiple batches
-            completed_jobs = self.wait_for_multiple_batch_completions(batch_job_ids)
-        
-        self.save_progress("All batches completed, downloading results")
-        
-        # Download and parse results from all batches
-        batch_results = self.download_and_parse_all_results(completed_jobs)
-        with open("batch_results.json", "w") as f:
-            json.dump(batch_results, f)
-        
+            # Submit batch jobs (chunked if necessary)
+            batch_job_ids = self.submit_batch_jobs_in_chunks()
+            self.save_progress(f"{len(batch_job_ids)} batch job(s) submitted, waiting for completion")
+
+            # Wait for all batches to complete
+            if len(batch_job_ids) == 1:
+                batch_job = self.wait_for_batch_completion(batch_job_ids[0])
+                completed_jobs = [batch_job]
+            else:
+                completed_jobs = self.wait_for_multiple_batch_completions(batch_job_ids)
+
+            self.save_progress("All batches completed, downloading results")
+
+            # Download and parse results from all batches
+            batch_results = self.download_and_parse_all_results(completed_jobs)
+
+            # Save checkpoint so we can resume if script crashes after this point
+            with open(checkpoint_file, 'w') as f:
+                json.dump(batch_results, f)
+            logger.info(f"Checkpoint saved to {checkpoint_file} — safe to resume if crash occurs")
+
         # Process results and update dataframe
         df = self.process_batch_results(df, batch_results)
         self.save_progress("Processing results")
-        
+
         # Update parent rows with 'A' variant data
         df = self.update_parent_rows(df)
         self.save_progress("Updating parent rows")
-        
+
         # Save results
         if not os.path.exists("output"):
             os.makedirs("output")
-        
+
         output_path = f"output/{output_file}"
         save_dataframe(df, output_path)
         self.save_progress("Saving results")
-        
+
+        # FIX 6: Save failed rows report
+        if self.failed_rows_report:
+            report_path = "failed_rows_report.json"
+            with open(report_path, 'w') as f:
+                json.dump(self.failed_rows_report, f, indent=2)
+            logger.warning(f"Failed rows report saved to {report_path} — {len(self.failed_rows_report)} rows had issues")
+
+        # Remove checkpoint after successful completion — clean slate for next run
+        if os.path.exists(checkpoint_file):
+            os.remove(checkpoint_file)
+            logger.info("Checkpoint file removed — processing completed successfully")
+
         # Calculate and display statistics
         end_time = time.time()
         processing_time = end_time - self.start_time
         success_rate = (self.successful_rows / self.total_rows) * 100 if self.total_rows > 0 else 0
-        
-        # Save final progress
+
         self.save_progress("Completed", output_path)
-        
+
         logger.info(f"Processing complete! Results saved to {output_path}")
         logger.info(f"Final dataset has {len(df)} rows and {len(df.columns)} columns")
-        
-        # Print detailed statistics
+
         print("\n" + "="*60)
         print("📊 BATCH PROCESSING STATISTICS")
         print("="*60)
@@ -1329,6 +1637,8 @@ or
         print(f"⏱️  Total processing time: {processing_time/60:.1f} minutes ({processing_time:.1f} seconds)")
         print(f"🔗 Total batch requests: {self.total_batch_requests}")
         print(f"📁 Output file: {output_path}")
+        if self.failed_rows_report:
+            print(f"⚠️  Failed rows report: failed_rows_report.json ({len(self.failed_rows_report)} rows)")
         print("="*60)
 
 
@@ -1375,13 +1685,19 @@ def main():
     input_ext = get_output_file_extension(INPUT_FILE)
     OUTPUT_FILE = f"batch_processed_data_{timestamp}{input_ext}"
     
+    # Start live dashboard server — accessible at your Railway URL
+    dashboard_port = int(os.getenv("PORT", 8080))
+    start_dashboard_server(port=dashboard_port)
+    print(f"\n📊 Live dashboard running at http://0.0.0.0:{dashboard_port}")
+    print(f"   Open your Railway URL to see live progress, logs and ETA\n")
+
     # Create processor with batch size limit
     processor = BatchDataProcessor(
         api_key=api_key,
         max_rows=MAX_ROWS,
-        max_requests_per_batch=200# Groq's safe limit (adjust if needed)
+        max_requests_per_batch=10000  # Safe for Groq — max 50k lines per file, reduces batch job count significantly
     )
-    
+
     print(f"\n🚀 Starting BATCH processing:")
     print(f"   • Input file: {INPUT_FILE}")
     print(f"   • Max rows: {MAX_ROWS if MAX_ROWS else 'No limit'}")
@@ -1394,8 +1710,7 @@ def main():
     
     # Run the processing
     try:
-        import asyncio
-        asyncio.run(processor.process_file(INPUT_FILE, OUTPUT_FILE))
+        processor.process_file(INPUT_FILE, OUTPUT_FILE)
         
         print(f"\n✅ Batch processing completed successfully!")
         print(f"📁 Output saved to: output/{OUTPUT_FILE}")
