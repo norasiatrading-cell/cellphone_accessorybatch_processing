@@ -601,7 +601,7 @@ class BatchDataProcessor:
                 "model": MODEL_NAME,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.6,
-                "max_tokens": 400
+                "max_tokens": 500
             }
         }
 
@@ -1686,7 +1686,7 @@ def main():
     processor = BatchDataProcessor(
         api_key=api_key,
         max_rows=MAX_ROWS,
-        max_requests_per_batch=10000  # Safe for Groq — max 50k lines per file, reduces batch job count significantly
+        max_requests_per_batch=1000  # 1000 per batch — balances quick Groq pickup vs manageable batch count
     )
 
     print(f"\n🚀 Starting BATCH processing:")
