@@ -316,7 +316,7 @@ def save_dataframe(df: pd.DataFrame, file_path: str) -> None:
 class BatchDataProcessor:
     """Main class for processing CSV/Excel data with Groq Batch API"""
     
-    def __init__(self, api_key: str, max_rows: Optional[int] = None, max_requests_per_batch: int = 10000):
+    def __init__(self, api_key: str, max_rows: Optional[int] = None, max_requests_per_batch: int = 1000):
         self.client = Groq(api_key=api_key)
         self.max_rows = max_rows
         self.max_requests_per_batch = max_requests_per_batch  # Groq's safe limit per batch
