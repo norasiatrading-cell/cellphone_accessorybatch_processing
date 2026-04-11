@@ -1355,6 +1355,15 @@ or
                 logger.error(f"Error applying variation logic for row {row_idx}: {e}")
         logger.info("Family variation logic applied.")
 
+        # Fix 22: Family-level title fallback — runs AFTER all variation logic
+        # For each family where Color/Pattern values are not all unique and non-empty,
+        # extract the variation value from title after ' - ' or ' -- ' separator
+        # Only touches the column matching variation_type (Color or Pattern)
+        # Never touches families where all children already have unique values
+        logger.info("Applying family title fallback for missing/duplicate values...")
+        df = self.fix_family_values_from_title(df)
+        logger.info("Family title fallback applied.")
+
         return df
 
     def apply_family_variation_logic(self, df: pd.DataFrame, row_idx: int) -> None:
@@ -1397,6 +1406,98 @@ or
         elif variation_type == "Pattern" and sales_attr:
             df.at[row_idx, 'Pattern'] = sales_attr
             logger.debug(f"Updated Pattern for {sku}: {sales_attr}")
+
+    def fix_family_values_from_title(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Fix 22: Family-level post-processing pass.
+
+        After all existing steps (Groq write + sales_attr overwrite) have run,
+        check each multi-variant family. If the column matching the family's
+        variation_type (Color for COLOR families, Pattern for PATTERN families)
+        does not have unique non-empty values across all children — extract
+        the variation value from the title after the last ' - ' or ' -- ' separator
+        and use that as the value for ALL children in the family.
+
+        This ensures:
+        - Empty values get filled
+        - Duplicate values get corrected
+        - All children in a family come from the same source
+        - Families already correct are never touched
+        - Only the correct column is touched per family
+        """
+
+        def extract_from_title(title):
+            """Extract variation value after last ' - ' or ' -- ' in title"""
+            title = str(title).strip()
+            for sep in [' - ', ' -- ', '- ']:
+                parts = title.rsplit(sep, 1)
+                if len(parts) == 2 and parts[1].strip():
+                    return parts[1].strip()
+            return ''
+
+        def is_valid_val(val):
+            """Check if a value is non-empty and meaningful"""
+            return str(val).strip().lower() not in ['', 'nan', 'none', 'not specified', 'not specified']
+
+        families_fixed = 0
+        rows_fixed = 0
+
+        for base_sku, family_info in self.families.items():
+            if not family_info['is_multi_variant']:
+                continue
+
+            variation_type = family_info.get('variation_type', 'Pattern')
+            # Only check the column matching the variation type
+            col = 'Color' if variation_type == 'COLOR' else 'Pattern'
+
+            # Get all child row indices for this family
+            child_indices = [m['index'] for m in family_info['members']]
+            if len(child_indices) < 2:
+                continue
+
+            # Collect current values for this column
+            current_values = {idx: str(df.at[idx, col]).strip() for idx in child_indices}
+            valid_vals = [v for v in current_values.values() if is_valid_val(v)]
+
+            all_valid  = len(valid_vals) == len(child_indices)
+            all_unique = len(set(valid_vals)) == len(valid_vals) if valid_vals else False
+
+            # STEP 2: If all non-empty AND all unique → perfect, skip
+            if all_valid and all_unique:
+                continue
+
+            # STEP 3: Extract from title for ALL children
+            title_vals = {idx: extract_from_title(df.at[idx, 'Title']) for idx in child_indices}
+
+            non_empty_extracted = [v for v in title_vals.values() if v.strip()]
+            all_extracted = len(non_empty_extracted) == len(child_indices)
+            all_unique_extracted = len(set(non_empty_extracted)) == len(non_empty_extracted)
+
+            if all_extracted and all_unique_extracted:
+                # STEP 5A: Title gives unique values for ALL — overwrite entire family
+                for idx in child_indices:
+                    old_val = current_values[idx]
+                    new_val = title_vals[idx]
+                    if old_val != new_val:
+                        df.at[idx, col] = new_val
+                        rows_fixed += 1
+                        logger.debug(f"Fix22 [{col}] {df.at[idx, 'SKU']}: '{old_val}' → '{new_val}' (family title)")
+                families_fixed += 1
+            else:
+                # STEP 5B: Title not complete/unique — only fill empty ones individually
+                family_changed = False
+                for idx in child_indices:
+                    old_val = current_values[idx]
+                    if not is_valid_val(old_val) and title_vals[idx].strip():
+                        df.at[idx, col] = title_vals[idx]
+                        rows_fixed += 1
+                        family_changed = True
+                        logger.debug(f"Fix22 [{col}] {df.at[idx, 'SKU']}: '' → '{title_vals[idx]}' (individual fill)")
+                if family_changed:
+                    families_fixed += 1
+
+        logger.info(f"Fix22: {rows_fixed} rows fixed across {families_fixed} families")
+        return df
 
     def calculate_prices(self, df: pd.DataFrame, row_idx: int) -> None:
         """Calculate price columns for a row"""
