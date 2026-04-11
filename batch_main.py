@@ -339,6 +339,10 @@ class BatchDataProcessor:
 
         # Fix 6: Failed rows report — tracks which rows failed and why
         self.failed_rows_report = []
+
+        # Shared progress tracking across parallel batch threads
+        self._total_requests_completed = 0
+        self._progress_lock = threading.Lock()
     
     def save_progress(self, status: str, output_file: str = None, estimated_rows_completed: int = None):
         """Save current progress to JSON file for real-time monitoring"""
@@ -1029,73 +1033,60 @@ or
     def wait_for_batch_completion(self, batch_job_id: str) -> Dict:
         """Wait for a single batch job to complete and return results"""
         logger.info(f"Waiting for batch job {batch_job_id} to complete...")
-        
+
         start_time = time.time()
         last_status_log = 0
-        check_interval = 3  # Check every 3 seconds for more responsive updates
-        
+        check_interval = 3
+        last_reported_completed = 0  # track last reported count for this batch
+
         while True:
             batch_job = self.client.batches.retrieve(batch_job_id)
-            
             current_time = time.time()
-            
-            # Update progress with batch API data
-            progress_updated = False
+
             if hasattr(batch_job, 'request_counts') and batch_job.request_counts:
                 counts = batch_job.request_counts
-                total = getattr(counts, 'total', 0)
-                completed_count = getattr(counts, 'completed', 0)
-                failed_count = getattr(counts, 'failed', 0)
-                
-                # Calculate progress based on request completion
-                if total > 0:
-                    # Calculate request completion percentage
-                    requests_completed = completed_count + failed_count
-                    request_progress_pct = (requests_completed / total) * 100
-                    
-                    # Estimate rows completed based on request progress
-                    # We use regular_rows_count instead of total_rows to avoid counting parent rows
-                    estimated_rows = int((requests_completed / total) * self.regular_rows_count)
-                    
-                    # Save progress with request-based percentage
-                    self.save_progress(
-                        f"Processing batch: {request_progress_pct:.1f}% ({requests_completed}/{total} requests)",
-                        estimated_rows_completed=estimated_rows
-                    )
-                    progress_updated = True
-            
-            # Fallback: Update progress even without request counts to keep UI responsive
-            if not progress_updated:
-                elapsed = (current_time - start_time) / 60
-                self.save_progress(f"Waiting for batch processing (elapsed: {elapsed:.1f} min)", estimated_rows_completed=0)
-                logger.debug(f"Progress update: No request counts yet, elapsed {elapsed:.1f} min")
-            
-            # Log detailed status every 60 seconds
+                total_in_batch = getattr(counts, 'total', 0)
+                completed_in_batch = getattr(counts, 'completed', 0) + getattr(counts, 'failed', 0)
+
+                if total_in_batch > 0:
+                    # Update shared counter — add only the NEW completions since last check
+                    delta = completed_in_batch - last_reported_completed
+                    if delta > 0:
+                        with self._progress_lock:
+                            self._total_requests_completed += delta
+                            total_done = self._total_requests_completed
+                        last_reported_completed = completed_in_batch
+
+                        # Calculate combined % across ALL batches
+                        pct = round(total_done / self.total_batch_requests * 100, 1) if self.total_batch_requests > 0 else 0
+                        estimated_rows = int(pct / 100 * self.regular_rows_count)
+                        self.save_progress(
+                            f"Groq processing: {pct}% ({total_done:,}/{self.total_batch_requests:,} requests)",
+                            estimated_rows_completed=estimated_rows
+                        )
+
+            # Log every 60 seconds
             if current_time - last_status_log >= 60:
                 elapsed_time = (current_time - start_time) / 60
-                logger.info(f"Batch job status: {batch_job.status} (elapsed: {elapsed_time:.1f} minutes)")
-                
                 if hasattr(batch_job, 'request_counts') and batch_job.request_counts:
                     counts = batch_job.request_counts
-                    # Access attributes directly, not as dictionary
-                    total = getattr(counts, 'total', 0)
-                    completed = getattr(counts, 'completed', 0) + getattr(counts, 'failed', 0)
-                    if total > 0:
-                        progress = (completed / total) * 100
-                        logger.info(f"Progress: {completed}/{total} requests ({progress:.1f}%)")
-                
+                    t = getattr(counts, 'total', 0)
+                    c = getattr(counts, 'completed', 0) + getattr(counts, 'failed', 0)
+                    pct_local = round(c / t * 100, 1) if t > 0 else 0
+                    logger.info(f"Batch {batch_job_id[:24]}... status: {batch_job.status} | local: {c}/{t} ({pct_local}%) | elapsed: {elapsed_time:.1f}m")
+                else:
+                    logger.info(f"Batch {batch_job_id[:24]}... status: {batch_job.status} | elapsed: {elapsed_time:.1f}m")
                 last_status_log = current_time
-            
+
             if batch_job.status == 'completed':
                 elapsed_time = (current_time - start_time) / 60
-                logger.info(f"Batch job completed in {elapsed_time:.1f} minutes!")
+                logger.info(f"Batch {batch_job_id[:24]}... completed in {elapsed_time:.1f} minutes!")
                 break
             elif batch_job.status in ['failed', 'expired', 'cancelled']:
                 raise Exception(f"Batch job {batch_job.status}: {getattr(batch_job, 'error', 'Unknown error')}")
-            
-            # Wait before checking again (reduced to 5 seconds for more responsive updates)
+
             time.sleep(check_interval)
-        
+
         return batch_job
 
     def download_and_parse_all_results(self, batch_jobs: List[Dict]) -> Dict[str, Dict]:
