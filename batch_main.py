@@ -1630,10 +1630,19 @@ or
             if declared_pct >= 0.70:
                 continue  # Matches declared type — skip ✅
 
-            # STEP 4: Check if 70%+ match OPPOSITE type → mismatch
+            # STEP 4: Option B — 70%+ match OPPOSITE type AND zero values
+            # of declared type present. This prevents wrongly reclassifying
+            # mixed families like those with both color values AND style codes.
+            # e.g. Family with 14 colors + 6 "Style X" codes → skip safely
             opposite_pct = pattern_pct if variation_type == 'COLOR' else color_pct
+            declared_count = color_count if variation_type == 'COLOR' else pattern_count
+            opposite_count = pattern_count if variation_type == 'COLOR' else color_count
+
             if opposite_pct < 0.70:
                 continue  # Below threshold — unclear, leave untouched ✅
+
+            if declared_count > 0:
+                continue  # Has genuine declared-type values — mixed family, leave untouched ✅
 
             # MISMATCH DETECTED — correct entire family
             logger.debug(
