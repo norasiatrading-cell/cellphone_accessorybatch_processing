@@ -1357,6 +1357,27 @@ or
                 logger.error(f"Error applying variation logic for row {row_idx}: {e}")
         logger.info("Family variation logic applied.")
 
+        # Fix 22: Family-level title fallback — runs AFTER all variation logic
+        # For each family where Color/Pattern values are not all unique and non-empty,
+        # extract the variation value from title after ' - ' or ' -- ' separator
+        # Only touches the column matching variation_type (Color or Pattern)
+        # Never touches families where all children already have unique values
+        logger.info("Applying family title fallback for missing/duplicate values...")
+        df = self.fix_family_values_from_title(df)
+        logger.info("Family title fallback applied.")
+
+        # Fix 23: Family-level variation type correction — runs AFTER Fix 22
+        # For each family, collect all children's Color/Pattern values and classify
+        # them using keyword lists. If 70%+ of values match a different type than
+        # what is declared, correct the entire family:
+        # → Update Variation type for all children and parent
+        # → Move values to the correct column
+        # → Clear the wrong column
+        # Only the correct column per family is ever touched
+        logger.info("Applying family variation type correction...")
+        df = self.fix_family_variation_type(df)
+        logger.info("Family variation type correction applied.")
+
         return df
 
     def apply_family_variation_logic(self, df: pd.DataFrame, row_idx: int) -> None:
@@ -1399,6 +1420,280 @@ or
         elif variation_type == "Pattern" and sales_attr:
             df.at[row_idx, 'Pattern'] = sales_attr
             logger.debug(f"Updated Pattern for {sku}: {sales_attr}")
+
+    def fix_family_values_from_title(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Fix 22: Family-level post-processing pass.
+
+        After all existing steps (Groq write + sales_attr overwrite) have run,
+        check each multi-variant family. If the column matching the family's
+        variation_type (Color for COLOR families, Pattern for PATTERN families)
+        does not have unique non-empty values across all children — extract
+        the variation value from the title after the last ' - ' or ' -- ' separator
+        and use that as the value for ALL children in the family.
+
+        This ensures:
+        - Empty values get filled
+        - Duplicate values get corrected
+        - All children in a family come from the same source
+        - Families already correct are never touched
+        - Only the correct column is touched per family
+        """
+
+        def extract_from_title(title):
+            """Extract variation value after last ' - ' or ' -- ' in title"""
+            title = str(title).strip()
+            for sep in [' - ', ' -- ', '- ']:
+                parts = title.rsplit(sep, 1)
+                if len(parts) == 2 and parts[1].strip():
+                    return parts[1].strip()
+            return ''
+
+        def is_valid_val(val):
+            """Check if a value is non-empty and meaningful"""
+            return str(val).strip().lower() not in ['', 'nan', 'none', 'not specified', 'not specified']
+
+        families_fixed = 0
+        rows_fixed = 0
+
+        for base_sku, family_info in self.families.items():
+            if not family_info['is_multi_variant']:
+                continue
+
+            variation_type = family_info.get('variation_type', 'Pattern')
+            # Only check the column matching the variation type
+            col = 'Color' if variation_type == 'COLOR' else 'Pattern'
+
+            # Get all child row indices for this family
+            child_indices = [m['index'] for m in family_info['members']]
+            if len(child_indices) < 2:
+                continue
+
+            # Collect current values for this column
+            current_values = {idx: str(df.at[idx, col]).strip() for idx in child_indices}
+            valid_vals = [v for v in current_values.values() if is_valid_val(v)]
+
+            all_valid  = len(valid_vals) == len(child_indices)
+            all_unique = len(set(valid_vals)) == len(valid_vals) if valid_vals else False
+
+            # STEP 2: If all non-empty AND all unique → perfect, skip
+            if all_valid and all_unique:
+                continue
+
+            # STEP 3: Extract from title for ALL children
+            title_vals = {idx: extract_from_title(df.at[idx, 'Title']) for idx in child_indices}
+
+            non_empty_extracted = [v for v in title_vals.values() if v.strip()]
+            all_extracted = len(non_empty_extracted) == len(child_indices)
+            all_unique_extracted = len(set(non_empty_extracted)) == len(non_empty_extracted)
+
+            if all_extracted and all_unique_extracted:
+                # STEP 5A: Title gives unique values for ALL — overwrite entire family
+                for idx in child_indices:
+                    old_val = current_values[idx]
+                    new_val = title_vals[idx]
+                    if old_val != new_val:
+                        df.at[idx, col] = new_val
+                        rows_fixed += 1
+                        logger.debug(f"Fix22 [{col}] {df.at[idx, 'SKU']}: '{old_val}' → '{new_val}' (family title)")
+                families_fixed += 1
+            else:
+                # STEP 5B: Title not complete/unique — only fill empty ones individually
+                family_changed = False
+                for idx in child_indices:
+                    old_val = current_values[idx]
+                    if not is_valid_val(old_val) and title_vals[idx].strip():
+                        df.at[idx, col] = title_vals[idx]
+                        rows_fixed += 1
+                        family_changed = True
+                        logger.debug(f"Fix22 [{col}] {df.at[idx, 'SKU']}: '' → '{title_vals[idx]}' (individual fill)")
+                if family_changed:
+                    families_fixed += 1
+
+        logger.info(f"Fix22: {rows_fixed} rows fixed across {families_fixed} families")
+        return df
+
+    def fix_family_variation_type(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Fix 23: Family-level variation type correction (Option B).
+
+        After Fix 22 has filled all Pattern/Color values from titles,
+        look at the entire family together and check whether the declared
+        variation type (COLOR or PATTERN) matches what the values actually are.
+
+        For each multi-variant family:
+          1. Collect ALL children's current values for the declared column
+             (Pattern for PATTERN families, Color for COLOR families)
+          2. Classify each value as 'color', 'pattern', or 'unclear'
+             using keyword lists
+          3. If 70%+ of values match the declared type → correct, skip
+          4. Option B: ONLY trigger if 70%+ values match opposite type
+             AND zero values of declared type exist
+             (prevents wrongly reclassifying mixed families like those
+              with Style codes + colors e.g. family 680604083)
+          5. Corrects entire family: updates Variation type for all
+             children and parent, moves values to correct column,
+             clears wrong column
+
+        Only touches Variation type, Color, and Pattern columns.
+        Never touches parent's Color/Pattern (always empty on parent).
+        """
+
+        # ── Keyword lists ──────────────────────────────────────────────
+        COLOR_KEYWORDS = [
+            'black', 'white', 'red', 'blue', 'green', 'pink', 'gold',
+            'silver', 'grey', 'gray', 'brown', 'purple', 'orange',
+            'yellow', 'transparent', 'clear', 'rose', 'navy', 'teal',
+            'beige', 'cream', 'coral', 'mint', 'lavender', 'titanium',
+            'starlight', 'midnight', 'space', 'champagne', 'coffee',
+            'wine', 'army', 'dark', 'light', 'bright', 'sky', 'baby',
+            'deep', 'smoky', 'apricot', 'khaki', 'olive', 'rainbow',
+            'colorful', 'multi-color', 'multicolor', 'gradient',
+            'obsidian', 'sapphire', 'amber', 'jade', 'indigo', 'maroon',
+            'cyan', 'magenta', 'violet', 'tan', 'peach', 'ivory',
+            'charcoal', 'lemon', 'aqua', 'turquoise', 'cobalt', 'rust',
+            'sand', 'caramel', 'taupe', 'mist', 'rock', 'confetti',
+            'denim', 'cactus', 'raspberry', 'coal', 'antique', 'reddish',
+            'soft', 'warm', 'cool', 'ash', 'stone', 'blush', 'nude',
+            'mocha', 'espresso', 'pewter', 'slate', 'fog', 'cloud',
+            'smoke', 'mauve', 'sage', 'clay', 'terracotta', 'mustard',
+        ]
+
+        PATTERN_KEYWORDS = [
+            'marble', 'floral', 'flower', 'butterfly', 'animal',
+            'cartoon', 'stripe', 'striped', 'polka', 'geometric',
+            'vintage', 'retro', 'paisley', 'checkered', 'camouflage',
+            'feather', 'angel', 'clover', 'swirl', 'wave', 'wavy',
+            'crocodile', 'distressed', 'glitter', 'star', 'heart',
+            'moon', 'crown', 'leaf', 'leaves', 'tartan', 'plaid',
+            'houndstooth', 'argyle', 'abstract', 'tie-dye', 'tiedye',
+            'dot', 'dotted', 'printed', 'print', 'drawing', 'painted',
+            'embossed', 'engraved', 'woven', 'braided', 'quilted',
+            'lace', 'mandala', 'tribal', 'aztec', 'bohemian', 'peacock',
+            'tiger', 'leopard', 'zebra', 'snake', 'dragon', 'skull',
+            'anchor', 'compass', 'monogram', 'initial', 'gourd',
+            'rhinestone', 'crystal', 'diamond', 'checker', 'grid',
+            'weave', 'knit', 'camo', 'galaxy', 'nebula', 'aurora',
+            'four-leaf', 'foliage', 'botanical', 'jungle', 'tropical',
+            'bird', 'cat', 'dog', 'bear', 'fox', 'deer', 'horse',
+            'fish', 'shell', 'sakura', 'cherry blossom', 'texture',
+            'style',
+        ]
+
+        def classify_value(val):
+            """Classify a single value as color, pattern, or unclear"""
+            val_lower = str(val).lower().strip()
+            is_color   = any(k in val_lower for k in COLOR_KEYWORDS)
+            is_pattern = any(k in val_lower for k in PATTERN_KEYWORDS)
+            if is_color and not is_pattern:
+                return 'color'
+            elif is_pattern and not is_color:
+                return 'pattern'
+            else:
+                return 'unclear'  # both or neither — too ambiguous
+
+        families_corrected = 0
+        rows_corrected = 0
+
+        for base_sku, family_info in self.families.items():
+            if not family_info['is_multi_variant']:
+                continue
+
+            variation_type = family_info.get('variation_type', 'Pattern')
+            # Determine which column to check based on declared type
+            col      = 'Color' if variation_type == 'COLOR' else 'Pattern'
+            opp_col  = 'Pattern' if variation_type == 'COLOR' else 'Color'
+            opp_type = 'Pattern' if variation_type == 'COLOR' else 'Color'
+
+            child_indices = [m['index'] for m in family_info['members']]
+            if len(child_indices) < 2:
+                continue
+
+            # STEP 1: Collect all children's current values
+            current_values = {
+                idx: str(df.at[idx, col]).strip()
+                for idx in child_indices
+            }
+            non_empty = [v for v in current_values.values()
+                        if v.lower() not in ['', 'nan', 'none',
+                                             'not specified', 'not specified']]
+            if not non_empty:
+                continue
+
+            # STEP 2: Classify each value
+            classifications = [classify_value(v) for v in non_empty]
+            total = len(classifications)
+            color_count   = sum(1 for c in classifications if c == 'color')
+            pattern_count = sum(1 for c in classifications if c == 'pattern')
+
+            color_pct   = color_count   / total
+            pattern_pct = pattern_count / total
+
+            # STEP 3: Check if 70%+ match declared type → correct, skip
+            declared_pct = color_pct if variation_type == 'COLOR' else pattern_pct
+            if declared_pct >= 0.70:
+                continue  # Matches declared type — skip ✅
+
+            # STEP 4: Option B — 70%+ match OPPOSITE type AND zero values
+            # of declared type present. This prevents wrongly reclassifying
+            # mixed families like those with both color values AND style codes.
+            # e.g. Family 680604083 with 14 colors + 6 "Style X" codes → skip safely
+            opposite_pct = pattern_pct if variation_type == 'COLOR' else color_pct
+            declared_count = color_count if variation_type == 'COLOR' else pattern_count
+            opposite_count = pattern_count if variation_type == 'COLOR' else color_count
+
+            if opposite_pct < 0.70:
+                continue  # Below threshold — unclear, leave untouched ✅
+
+            if declared_count > 0:
+                continue  # Has genuine declared-type values — mixed family, leave untouched ✅
+
+            # MISMATCH DETECTED — correct entire family
+            logger.debug(
+                f"Fix23: Family {base_sku} declared {variation_type} "
+                f"but {opposite_pct*100:.0f}% of values are {opp_type} "
+                f"→ correcting to {opp_type.upper()}"
+            )
+
+            # Correct all children
+            for idx in child_indices:
+                old_val = current_values[idx]
+                # Move value from wrong column → correct column
+                df.at[idx, opp_col]  = old_val   # write to correct column
+                df.at[idx, col]      = ''         # clear wrong column
+                # Update Variation type
+                df.at[idx, 'Variation type'] = opp_type.upper()
+                rows_corrected += 1
+                logger.debug(
+                    f"Fix23: {df.at[idx, 'SKU']} "
+                    f"{col}='' {opp_col}='{old_val}' "
+                    f"Variation type={opp_type.upper()}"
+                )
+
+            # Update parent row Variation type only
+            # (parent never has Color/Pattern values — always empty)
+            parent_rows = df[
+                (df['SKU'] == base_sku) &
+                (df['Variation relation'] == 'Parent')
+            ]
+            if not parent_rows.empty:
+                parent_idx = parent_rows.index[0]
+                df.at[parent_idx, 'Variation type'] = opp_type.upper()
+                logger.debug(
+                    f"Fix23: Parent {base_sku} "
+                    f"Variation type updated to {opp_type.upper()}"
+                )
+
+            # Update family_info so downstream logic is consistent
+            family_info['variation_type'] = opp_type
+
+            families_corrected += 1
+
+        logger.info(
+            f"Fix23: {rows_corrected} rows corrected "
+            f"across {families_corrected} families"
+        )
+        return df
 
     def calculate_prices(self, df: pd.DataFrame, row_idx: int) -> None:
         """Calculate price columns for a row"""
