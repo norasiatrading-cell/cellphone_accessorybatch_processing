@@ -343,6 +343,9 @@ class BatchDataProcessor:
         # Shared progress tracking across parallel batch threads
         self._total_requests_completed = 0
         self._progress_lock = threading.Lock()
+
+        # Maps batch_id → requests list so failed batches can be resubmitted
+        self._batch_id_to_requests = {}
     
     def save_progress(self, status: str, output_file: str = None, estimated_rows_completed: int = None):
         """Save current progress to JSON file for real-time monitoring"""
@@ -923,6 +926,8 @@ or
         )
 
         os.remove(batch_file_path)
+        # Store requests so we can resubmit if Groq fails this batch
+        self._batch_id_to_requests[batch_job.id] = requests
         logger.info(f"Batch [{label}] submitted with ID: {batch_job.id} ({len(requests)} requests)")
         return batch_job.id
 
@@ -1089,24 +1094,86 @@ or
 
         return batch_job
 
-    def download_and_parse_all_results(self, batch_jobs: List[Dict]) -> Dict[str, Dict]:
-        """Download and parse results from multiple batch jobs"""
+    def download_and_parse_all_results(self, batch_jobs: List[Dict], checkpoint_file: str = None) -> Dict[str, Dict]:
+        """Download and parse results from multiple batch jobs.
+        Saves incrementally to checkpoint after each batch so a crash
+        mid-download does not lose all previously downloaded results."""
         logger.info(f"Downloading and parsing results from {len(batch_jobs)} batch jobs...")
-        
+
+        # Load any existing partial checkpoint so we can append to it
         all_results = {}
-        
+        if checkpoint_file and os.path.exists(checkpoint_file):
+            try:
+                with open(checkpoint_file, 'r') as f:
+                    all_results = json.load(f)
+                logger.info(f"Loaded {len(all_results)} existing results from partial checkpoint")
+            except Exception as e:
+                logger.warning(f"Could not load partial checkpoint: {e} — starting fresh")
+                all_results = {}
+
         for idx, batch_job in enumerate(batch_jobs):
             logger.info(f"Downloading results from batch {idx + 1}/{len(batch_jobs)}: {batch_job.id}")
             results = self.download_and_parse_results(batch_job)
             all_results.update(results)
-        
+
+            # Save incrementally after each batch — if script crashes mid-download,
+            # already-downloaded results are preserved in the checkpoint
+            if checkpoint_file:
+                try:
+                    with open(checkpoint_file, 'w') as f:
+                        json.dump(all_results, f)
+                    logger.debug(f"Incremental checkpoint saved: {len(all_results)} results after batch {idx + 1}")
+                except Exception as e:
+                    logger.warning(f"Could not save incremental checkpoint: {e}")
+
         logger.info(f"Total results parsed: {len(all_results)}")
         return all_results
 
     def download_and_parse_results(self, batch_job) -> Dict[str, Dict]:
         """Download and parse batch results from a single job"""
         logger.info(f"Downloading results for batch job {batch_job.id}...")
-        
+
+        # Guard: if Groq produced no output file, retry up to 3 times
+        # This can happen when Groq fails a batch internally
+        MAX_RETRIES = 3
+        if not batch_job.output_file_id:
+            original_id = batch_job.id
+            requests = self._batch_id_to_requests.get(batch_job.id, [])
+
+            for attempt in range(1, MAX_RETRIES + 1):
+                if not requests:
+                    logger.error(f"Batch {original_id} failed and no requests stored — cannot retry")
+                    break
+
+                logger.warning(
+                    f"Batch {original_id} has no output_file_id "
+                    f"(attempt {attempt}/{MAX_RETRIES}) — resubmitting to Groq..."
+                )
+                time.sleep(30 * attempt)  # wait 30s, 60s, 90s between retries
+
+                try:
+                    new_batch_id = self.upload_and_create_batch(
+                        requests, f"retry_{original_id[:16]}_{attempt}"
+                    )
+                    logger.info(f"Retry batch submitted: {new_batch_id} — waiting for completion...")
+                    batch_job = self.wait_for_batch_completion(new_batch_id)
+                    if batch_job.output_file_id:
+                        logger.info(f"Retry {attempt} succeeded for batch {original_id}")
+                        break
+                except Exception as e:
+                    logger.error(f"Retry {attempt} failed for batch {original_id}: {e}")
+
+            if not batch_job.output_file_id:
+                logger.error(
+                    f"Batch {original_id} failed after {MAX_RETRIES} retries — "
+                    f"affected rows will have empty columns in output."
+                )
+                self.failed_rows_report.append({
+                    "batch_id": original_id,
+                    "reason": f"Groq returned no output after {MAX_RETRIES} retries"
+                })
+                return {}
+
         # Download output file
         output_file = self.client.files.content(batch_job.output_file_id)
         
@@ -1866,11 +1933,9 @@ or
             self.save_progress("All batches completed, downloading results")
 
             # Download and parse results from all batches
-            batch_results = self.download_and_parse_all_results(completed_jobs)
-
-            # Save checkpoint so we can resume if script crashes after this point
-            with open(checkpoint_file, 'w') as f:
-                json.dump(batch_results, f)
+            # Pass checkpoint_file so results are saved incrementally after each batch
+            # This means a crash mid-download loses at most ONE batch, not everything
+            batch_results = self.download_and_parse_all_results(completed_jobs, checkpoint_file=checkpoint_file)
             logger.info(f"Checkpoint saved to {checkpoint_file} — safe to resume if crash occurs")
 
         # Process results and update dataframe
