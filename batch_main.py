@@ -344,6 +344,9 @@ class BatchDataProcessor:
         self._total_requests_completed = 0
         self._progress_lock = threading.Lock()
 
+        # Maps batch_id → requests list so failed batches can be resubmitted (Fix 24)
+        self._batch_id_to_requests = {}
+
 
     
     def save_progress(self, status: str, output_file: str = None, estimated_rows_completed: int = None):
@@ -925,6 +928,8 @@ or
         )
 
         os.remove(batch_file_path)
+        # Store requests so we can resubmit if Groq fails this batch (Fix 24)
+        self._batch_id_to_requests[batch_job.id] = requests
         logger.info(f"Batch [{label}] submitted with ID: {batch_job.id} ({len(requests)} requests)")
         return batch_job.id
 
@@ -969,6 +974,14 @@ or
         """Wait for batch jobs in groups to avoid hitting Groq concurrent job limits"""
         import threading
 
+        # Fix 26: stand-in for a batch that never completed, so the existing
+        # Fix 24 retry path can pick it up instead of the requests being lost.
+        class _FailedBatchStub:
+            def __init__(self, batch_id):
+                self.id = batch_id
+                self.output_file_id = None
+                self.status = 'failed'
+
         MAX_CONCURRENT = 5  # max batches running in parallel at same time — safe for Groq
         total = len(batch_job_ids)
         logger.info(f"Waiting for {total} batch jobs in groups of {MAX_CONCURRENT}...")
@@ -992,6 +1005,10 @@ or
                 logger.error(f"Batch {idx + 1}/{total} failed: {batch_job_id} - {e}")
                 errors_dict[batch_job_id] = str(e)
                 completed_count[0] += 1
+                # Fix 26: previously a failed batch was dropped entirely and its
+                # requests silently lost. Emit a stub with output_file_id=None so
+                # it flows into download_and_parse_results and hits Fix 24's retry.
+                results_dict[batch_job_id] = _FailedBatchStub(batch_job_id)
 
         # Process in groups of MAX_CONCURRENT to respect Groq concurrent job limits
         num_groups = (total + MAX_CONCURRENT - 1) // MAX_CONCURRENT
@@ -1041,8 +1058,29 @@ or
         check_interval = 3
         last_reported_completed = 0  # track last reported count for this batch
 
+        poll_errors = 0
+        MAX_POLL_ERRORS = 10
+
         while True:
-            batch_job = self.client.batches.retrieve(batch_job_id)
+            # Fix 26: a transient poll failure must not discard a whole batch.
+            # Retry the poll; only give up after many consecutive failures.
+            try:
+                batch_job = self.client.batches.retrieve(batch_job_id)
+                poll_errors = 0
+            except Exception as e:
+                poll_errors += 1
+                logger.warning(
+                    f"Status poll failed for {batch_job_id[:24]}... "
+                    f"({poll_errors}/{MAX_POLL_ERRORS}): {e}"
+                )
+                if poll_errors >= MAX_POLL_ERRORS:
+                    raise Exception(
+                        f"Batch {batch_job_id}: status poll failed "
+                        f"{MAX_POLL_ERRORS} times consecutively"
+                    )
+                time.sleep(min(30, 5 * poll_errors))
+                continue
+
             current_time = time.time()
 
             if hasattr(batch_job, 'request_counts') and batch_job.request_counts:
@@ -1091,17 +1129,48 @@ or
 
         return batch_job
 
-    def download_and_parse_all_results(self, batch_jobs: List[Dict]) -> Dict[str, Dict]:
-        """Download and parse results from multiple batch jobs"""
+    def download_and_parse_all_results(self, batch_jobs: List[Dict], checkpoint_file: str = None) -> Dict[str, Dict]:
+        """Download and parse results from multiple batch jobs.
+        Fix 25: Saves checkpoint incrementally after each batch so a crash
+        mid-download loses at most ONE batch, not everything."""
         logger.info(f"Downloading and parsing results from {len(batch_jobs)} batch jobs...")
-        
+
+        # Load any existing partial checkpoint so we can append to it
         all_results = {}
-        
+        if checkpoint_file and os.path.exists(checkpoint_file):
+            try:
+                with open(checkpoint_file, 'r') as f:
+                    all_results = json.load(f)
+                logger.info(f"Loaded {len(all_results)} existing results from partial checkpoint")
+            except Exception as e:
+                logger.warning(f"Could not load partial checkpoint: {e} — starting fresh")
+                all_results = {}
+
         for idx, batch_job in enumerate(batch_jobs):
             logger.info(f"Downloading results from batch {idx + 1}/{len(batch_jobs)}: {batch_job.id}")
-            results = self.download_and_parse_results(batch_job)
-            all_results.update(results)
-        
+            # Fix 26: never let ONE bad batch kill the whole download loop.
+            # Log it, record it, and carry on with the remaining batches.
+            try:
+                results = self.download_and_parse_results(batch_job)
+                all_results.update(results)
+            except Exception as e:
+                bid = getattr(batch_job, 'id', 'unknown')
+                logger.error(f"Batch {bid} download failed: {e} — skipping, continuing with remaining batches")
+                self.failed_rows_report.append({
+                    "batch_id": bid,
+                    "reason": f"download failed: {e}"
+                })
+                continue
+
+            # Fix 25: Save incrementally after each batch — crash loses at most 1 batch
+            if checkpoint_file:
+                try:
+                    with open(checkpoint_file, 'w') as f:
+                        json.dump(all_results, f)
+                    logger.debug(f"Incremental checkpoint saved: {len(all_results)} results after batch {idx + 1}")
+                except Exception as e:
+                    logger.warning(f"Could not save incremental checkpoint: {e}")
+
         logger.info(f"Total results parsed: {len(all_results)}")
         return all_results
 
@@ -1109,15 +1178,78 @@ or
         """Download and parse batch results from a single job"""
         logger.info(f"Downloading results for batch job {batch_job.id}...")
 
-        # Download output file
-        output_file = self.client.files.content(batch_job.output_file_id)
-        
+        # Fix 24: Guard + retry if Groq produced no output file
+        # This happens when Groq fails a batch internally
+        MAX_RETRIES = 3
+        if not batch_job.output_file_id:
+            original_id = batch_job.id
+            requests = self._batch_id_to_requests.get(batch_job.id, [])
+
+            for attempt in range(1, MAX_RETRIES + 1):
+                if not requests:
+                    logger.error(f"Batch {original_id} failed and no requests stored — cannot retry")
+                    break
+
+                logger.warning(
+                    f"Batch {original_id} has no output_file_id "
+                    f"(attempt {attempt}/{MAX_RETRIES}) — resubmitting to Groq..."
+                )
+                time.sleep(30 * attempt)  # wait 30s, 60s, 90s between retries
+
+                try:
+                    new_batch_id = self.upload_and_create_batch(
+                        requests, f"retry_{original_id[:16]}_{attempt}"
+                    )
+                    logger.info(f"Retry batch submitted: {new_batch_id} — waiting for completion...")
+                    batch_job = self.wait_for_batch_completion(new_batch_id)
+                    if batch_job.output_file_id:
+                        logger.info(f"Retry {attempt} succeeded for batch {original_id}")
+                        break
+                except Exception as e:
+                    logger.error(f"Retry {attempt} failed for batch {original_id}: {e}")
+
+            if not batch_job.output_file_id:
+                logger.error(
+                    f"Batch {original_id} failed after {MAX_RETRIES} retries — "
+                    f"affected rows will have empty columns in output."
+                )
+                self.failed_rows_report.append({
+                    "batch_id": original_id,
+                    "reason": f"Groq returned no output after {MAX_RETRIES} retries"
+                })
+                return {}
+
+        # Download output file — Fix 26: retry on transient network/API errors
+        # so a momentary blip doesn't discard an entire completed batch
+        output_text = None
+        DOWNLOAD_RETRIES = 3
+        for dl_attempt in range(1, DOWNLOAD_RETRIES + 1):
+            try:
+                output_file = self.client.files.content(batch_job.output_file_id)
+                output_text = output_file.text()
+                break
+            except Exception as e:
+                logger.warning(
+                    f"Download attempt {dl_attempt}/{DOWNLOAD_RETRIES} failed "
+                    f"for batch {batch_job.id}: {e}"
+                )
+                if dl_attempt < DOWNLOAD_RETRIES:
+                    time.sleep(10 * dl_attempt)
+
+        if output_text is None:
+            logger.error(
+                f"Batch {batch_job.id}: could not download output after "
+                f"{DOWNLOAD_RETRIES} attempts — affected rows will have empty columns."
+            )
+            self.failed_rows_report.append({
+                "batch_id": batch_job.id,
+                "reason": f"output download failed after {DOWNLOAD_RETRIES} attempts"
+            })
+            return {}
+
         # Parse results
         results = {}
         failed_requests = []
-        
-        # Get the text content - .text() is a method
-        output_text = output_file.text()
         
         for line in output_text.strip().split('\n'):
             if not line:
@@ -1363,8 +1495,14 @@ or
         # Only touches the column matching variation_type (Color or Pattern)
         # Never touches families where all children already have unique values
         logger.info("Applying family title fallback for missing/duplicate values...")
-        df = self.fix_family_values_from_title(df)
-        logger.info("Family title fallback applied.")
+        try:
+            df = self.fix_family_values_from_title(df)
+            logger.info("Family title fallback applied.")
+        except Exception as e:
+            # Fix 26: Fix22 is an enhancement, never a blocker. If it fails,
+            # keep the Groq/sales_attr values and continue — otherwise the
+            # checkpoint would make the script crash here on every rerun.
+            logger.error(f"Fix22 failed ({e}) — continuing without title fallback")
 
         # Fix 23: Family-level variation type correction — runs AFTER Fix 22
         # For each family, collect all children's Color/Pattern values and classify
@@ -1375,8 +1513,12 @@ or
         # → Clear the wrong column
         # Only the correct column per family is ever touched
         logger.info("Applying family variation type correction...")
-        df = self.fix_family_variation_type(df)
-        logger.info("Family variation type correction applied.")
+        try:
+            df = self.fix_family_variation_type(df)
+            logger.info("Family variation type correction applied.")
+        except Exception as e:
+            # Fix 26: Fix23 is an enhancement, never a blocker.
+            logger.error(f"Fix23 failed ({e}) — continuing without type correction")
 
         return df
 
@@ -1456,6 +1598,20 @@ or
         families_fixed = 0
         rows_fixed = 0
 
+        # Fix 26: tolerate a missing Title column instead of crashing
+        has_title = 'Title' in df.columns
+        if not has_title:
+            logger.warning("Fix22: no 'Title' column present — skipping title fallback")
+            return df
+
+        # Fix 26: an all-NaN column can be float64, which rejects string writes
+        # with a TypeError. Coerce to object so assignments always succeed.
+        for _c in ('Color', 'Pattern'):
+            if _c in df.columns and df[_c].dtype != object:
+                df[_c] = df[_c].astype(object)
+
+        valid_index = df.index
+
         for base_sku, family_info in self.families.items():
             if not family_info['is_multi_variant']:
                 continue
@@ -1463,9 +1619,13 @@ or
             variation_type = family_info.get('variation_type', 'Pattern')
             # Only check the column matching the variation type
             col = 'Color' if variation_type == 'COLOR' else 'Pattern'
+            if col not in df.columns:
+                continue
 
             # Get all child row indices for this family
-            child_indices = [m['index'] for m in family_info['members']]
+            # Fix 26: drop any stale index that is no longer in the dataframe
+            child_indices = [m['index'] for m in family_info['members']
+                            if m.get('index') in valid_index]
             if len(child_indices) < 2:
                 continue
 
@@ -1495,7 +1655,7 @@ or
                     if old_val != new_val:
                         df.at[idx, col] = new_val
                         rows_fixed += 1
-                        logger.debug(f"Fix22 [{col}] {df.at[idx, 'SKU']}: '{old_val}' → '{new_val}' (family title)")
+                        logger.debug(f"Fix22 [{col}] {base_sku}: '{old_val}' → '{new_val}' (family title)")
                 families_fixed += 1
             else:
                 # STEP 5B: Title not complete/unique — only fill empty ones individually
@@ -1506,7 +1666,7 @@ or
                         df.at[idx, col] = title_vals[idx]
                         rows_fixed += 1
                         family_changed = True
-                        logger.debug(f"Fix22 [{col}] {df.at[idx, 'SKU']}: '' → '{title_vals[idx]}' (individual fill)")
+                        logger.debug(f"Fix22 [{col}] {base_sku}: '' → '{title_vals[idx]}' (individual fill)")
                 if family_changed:
                     families_fixed += 1
 
@@ -1595,6 +1755,19 @@ or
         families_corrected = 0
         rows_corrected = 0
 
+        # Fix 26: required columns must exist, else skip entirely
+        for required in ('Color', 'Pattern', 'Variation type'):
+            if required not in df.columns:
+                logger.warning(f"Fix23: no '{required}' column present — skipping type correction")
+                return df
+
+        # Fix 26: coerce to object dtype so string writes never raise TypeError
+        for _c in ('Color', 'Pattern', 'Variation type'):
+            if df[_c].dtype != object:
+                df[_c] = df[_c].astype(object)
+
+        valid_index = df.index
+
         for base_sku, family_info in self.families.items():
             if not family_info['is_multi_variant']:
                 continue
@@ -1605,7 +1778,9 @@ or
             opp_col  = 'Pattern' if variation_type == 'COLOR' else 'Color'
             opp_type = 'Pattern' if variation_type == 'COLOR' else 'Color'
 
-            child_indices = [m['index'] for m in family_info['members']]
+            # Fix 26: drop any stale index that is no longer in the dataframe
+            child_indices = [m['index'] for m in family_info['members']
+                            if m.get('index') in valid_index]
             if len(child_indices) < 2:
                 continue
 
@@ -1640,7 +1815,6 @@ or
             # e.g. Family 680604083 with 14 colors + 6 "Style X" codes → skip safely
             opposite_pct = pattern_pct if variation_type == 'COLOR' else color_pct
             declared_count = color_count if variation_type == 'COLOR' else pattern_count
-            opposite_count = pattern_count if variation_type == 'COLOR' else color_count
 
             if opposite_pct < 0.70:
                 continue  # Below threshold — unclear, leave untouched ✅
@@ -1665,17 +1839,20 @@ or
                 df.at[idx, 'Variation type'] = opp_type.upper()
                 rows_corrected += 1
                 logger.debug(
-                    f"Fix23: {df.at[idx, 'SKU']} "
+                    f"Fix23: {base_sku} row {idx} "
                     f"{col}='' {opp_col}='{old_val}' "
                     f"Variation type={opp_type.upper()}"
                 )
 
             # Update parent row Variation type only
             # (parent never has Color/Pattern values — always empty)
-            parent_rows = df[
-                (df['SKU'] == base_sku) &
-                (df['Variation relation'] == 'Parent')
-            ]
+            if 'SKU' in df.columns and 'Variation relation' in df.columns:
+                parent_rows = df[
+                    (df['SKU'] == base_sku) &
+                    (df['Variation relation'] == 'Parent')
+                ]
+            else:
+                parent_rows = df.iloc[0:0]
             if not parent_rows.empty:
                 parent_idx = parent_rows.index[0]
                 df.at[parent_idx, 'Variation type'] = opp_type.upper()
@@ -1870,12 +2047,10 @@ or
             self.save_progress("All batches completed, downloading results")
 
             # Download and parse results from all batches
-            batch_results = self.download_and_parse_all_results(completed_jobs)
-
-            # Save checkpoint so we can resume if script crashes after this point
-            with open(checkpoint_file, 'w') as f:
-                json.dump(batch_results, f)
-            logger.info(f"Checkpoint saved to {checkpoint_file} — safe to resume if crash occurs")
+            # Fix 25: Pass checkpoint_file so results are saved incrementally
+            # after each batch — crash loses at most ONE batch, not everything
+            batch_results = self.download_and_parse_all_results(completed_jobs, checkpoint_file=checkpoint_file)
+            logger.info(f"All results downloaded and checkpoint saved to {checkpoint_file}")
 
         # Process results and update dataframe
         df = self.process_batch_results(df, batch_results)
@@ -1989,7 +2164,7 @@ def main():
     print(f"\n🚀 Starting BATCH processing:")
     print(f"   • Input file: {INPUT_FILE}")
     print(f"   • Max rows: {MAX_ROWS if MAX_ROWS else 'No limit'}")
-    print(f"   • Max requests per batch: 10,000 (auto-chunking enabled)")
+    print(f"   • Max requests per batch: 1,000 (auto-chunking enabled)")
     print(f"   • Cost savings: ~50% compared to real-time API")
     print(f"   • Processing mode: Batch (submit all → wait → get results)")
     print(f"   • Expected batch completion: 5-30 minutes depending on queue")
