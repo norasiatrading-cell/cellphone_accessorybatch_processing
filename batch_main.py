@@ -18,8 +18,18 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# MODEL_NAME = "meta-llama/llama-4-scout-17b-16e-instruct"
-MODEL_NAME = "llama-3.3-70b-versatile"
+# Fix 28: llama-3.3-70b-versatile was DECOMMISSIONED by Groq on 2026-08-16.
+# Every request returned model_decommissioned, so batches "completed" with
+# 100% failures and produced an error file instead of an output file.
+# Groq's recommended replacement for Llama 3.3 70B Versatile is
+# openai/gpt-oss-120b (alternative: qwen/qwen3.6-27b).
+# Override in batch_config.json with "MODEL_NAME": "<model id>".
+#
+# Retired — do not use:
+#   "llama-3.3-70b-versatile"                      (shut down 2026-08-16)
+#   "llama-3.1-8b-instant"                         (shut down 2026-08-16)
+#   "meta-llama/llama-4-scout-17b-16e-instruct"    (deprecated)
+MODEL_NAME = "openai/gpt-oss-120b"
 
 # Configure logging
 logging.basicConfig(
@@ -346,6 +356,9 @@ class BatchDataProcessor:
 
         # Maps batch_id → requests list so failed batches can be resubmitted (Fix 24)
         self._batch_id_to_requests = {}
+
+        # Fix 27: set when Groq's error file indicates a deterministic failure
+        self._last_error_is_permanent = False
 
 
     
@@ -1113,14 +1126,38 @@ or
                     t = getattr(counts, 'total', 0)
                     c = getattr(counts, 'completed', 0) + getattr(counts, 'failed', 0)
                     pct_local = round(c / t * 100, 1) if t > 0 else 0
-                    logger.info(f"Batch {batch_job_id[:24]}... status: {batch_job.status} | local: {c}/{t} ({pct_local}%) | elapsed: {elapsed_time:.1f}m")
+                    ok   = getattr(counts, 'completed', 0)
+                    bad  = getattr(counts, 'failed', 0)
+                    # Fix 27: report ok/failed separately. Summing them made a
+                    # batch where every request FAILED display as "100%".
+                    logger.info(
+                        f"Batch {batch_job_id[:24]}... status: {batch_job.status} | "
+                        f"local: {c}/{t} ({pct_local}%) [ok={ok} failed={bad}] | "
+                        f"elapsed: {elapsed_time:.1f}m"
+                    )
                 else:
                     logger.info(f"Batch {batch_job_id[:24]}... status: {batch_job.status} | elapsed: {elapsed_time:.1f}m")
                 last_status_log = current_time
 
             if batch_job.status == 'completed':
                 elapsed_time = (current_time - start_time) / 60
-                logger.info(f"Batch {batch_job_id[:24]}... completed in {elapsed_time:.1f} minutes!")
+                # Fix 27: surface a batch that "completed" with every request failed
+                ok = bad = 0
+                if hasattr(batch_job, 'request_counts') and batch_job.request_counts:
+                    ok  = getattr(batch_job.request_counts, 'completed', 0)
+                    bad = getattr(batch_job.request_counts, 'failed', 0)
+                if bad and not ok:
+                    logger.error(
+                        f"Batch {batch_job_id[:24]}... reports 'completed' but ALL "
+                        f"{bad} requests FAILED — Groq will return no output file."
+                    )
+                elif bad:
+                    logger.warning(
+                        f"Batch {batch_job_id[:24]}... completed in {elapsed_time:.1f} "
+                        f"minutes with {bad} failed / {ok} ok"
+                    )
+                else:
+                    logger.info(f"Batch {batch_job_id[:24]}... completed in {elapsed_time:.1f} minutes!")
                 break
             elif batch_job.status in ['failed', 'expired', 'cancelled']:
                 raise Exception(f"Batch job {batch_job.status}: {getattr(batch_job, 'error', 'Unknown error')}")
@@ -1174,6 +1211,62 @@ or
         logger.info(f"Total results parsed: {len(all_results)}")
         return all_results
 
+    def log_batch_error_file(self, batch_job) -> str:
+        """Fix 27: read Groq's error file for a batch that produced no output.
+        Returns the first error message found (or '') and logs a summary.
+        Purely diagnostic — never raises."""
+        err_id = getattr(batch_job, 'error_file_id', None)
+        bid = getattr(batch_job, 'id', 'unknown')
+
+        if not err_id:
+            logger.error(
+                f"Batch {bid}: no output_file_id AND no error_file_id. "
+                f"Groq accepted the batch but produced nothing — "
+                f"usually an account quota/rate limit or a Groq-side fault."
+            )
+            # surface top-level error if the SDK exposed one
+            top = getattr(batch_job, 'errors', None) or getattr(batch_job, 'error', None)
+            if top:
+                logger.error(f"Batch {bid}: batch-level error → {top}")
+            return ""
+
+        try:
+            raw = self.client.files.content(err_id).text()
+        except Exception as e:
+            logger.error(f"Batch {bid}: could not read error file {err_id}: {e}")
+            return ""
+
+        reasons = {}
+        first = ""
+        for line in raw.strip().split('\n'):
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            err = rec.get('error') or {}
+            if isinstance(err, dict):
+                msg = err.get('message') or err.get('code') or str(err)
+            else:
+                msg = str(err)
+            if not msg and rec.get('response'):
+                body = rec['response'].get('body') or {}
+                msg = str(body.get('error', ''))
+            if msg:
+                first = first or msg
+                key = str(msg)[:180]
+                reasons[key] = reasons.get(key, 0) + 1
+
+        if reasons:
+            logger.error(f"Batch {bid}: GROQ REJECTED THE REQUESTS. Reasons:")
+            for msg, n in sorted(reasons.items(), key=lambda kv: -kv[1])[:5]:
+                logger.error(f"    [{n} requests] {msg}")
+        else:
+            logger.error(f"Batch {bid}: error file present but no parsable messages. "
+                        f"First 500 chars: {raw[:500]}")
+        return first
+
     def download_and_parse_results(self, batch_job) -> Dict[str, Dict]:
         """Download and parse batch results from a single job"""
         logger.info(f"Downloading results for batch job {batch_job.id}...")
@@ -1185,9 +1278,24 @@ or
             original_id = batch_job.id
             requests = self._batch_id_to_requests.get(batch_job.id, [])
 
+            # Fix 27: when there is no output file Groq almost always wrote an
+            # ERROR file explaining why. Read it and log the real reason instead
+            # of retrying blind. This is the difference between "it failed" and
+            # "it failed because X".
+            self.log_batch_error_file(batch_job)
+
             for attempt in range(1, MAX_RETRIES + 1):
                 if not requests:
                     logger.error(f"Batch {original_id} failed and no requests stored — cannot retry")
+                    break
+
+                # Fix 27: some failures are deterministic — resubmitting the exact
+                # same payload will fail identically. Don't burn 3 minutes proving it.
+                if attempt > 1 and getattr(self, '_last_error_is_permanent', False):
+                    logger.error(
+                        f"Batch {original_id}: failure is deterministic "
+                        f"(same payload will fail again) — abandoning retries."
+                    )
                     break
 
                 logger.warning(
@@ -1205,6 +1313,16 @@ or
                     if batch_job.output_file_id:
                         logger.info(f"Retry {attempt} succeeded for batch {original_id}")
                         break
+                    # Still no output — read Groq's error file for THIS attempt
+                    msg = self.log_batch_error_file(batch_job)
+                    permanent_markers = (
+                        'invalid', 'not found', 'unsupported', 'decommission',
+                        'does not exist', 'too large', 'exceed', 'context length',
+                        'malformed', 'unauthorized', 'forbidden', 'model_not_found'
+                    )
+                    self._last_error_is_permanent = any(
+                        k in msg.lower() for k in permanent_markers
+                    ) if msg else False
                 except Exception as e:
                     logger.error(f"Retry {attempt} failed for batch {original_id}: {e}")
 
@@ -1993,9 +2111,56 @@ or
         
         return df
 
+    def verify_model_available(self) -> bool:
+        """Fix 28: confirm MODEL_NAME is live on Groq BEFORE submitting batches.
+
+        A decommissioned model does not fail loudly in batch mode — Groq accepts
+        the batch, fails every request internally, and returns an error file with
+        no output file. That looks like a mysterious infrastructure problem and
+        costs ~20 minutes of retries to discover. This check costs one API call.
+        Returns True if verified or if the check itself could not run.
+        """
+        try:
+            models = self.client.models.list()
+            ids = [m.id for m in getattr(models, 'data', [])]
+            if not ids:
+                logger.warning("Model list came back empty — skipping preflight check")
+                return True
+            if MODEL_NAME in ids:
+                logger.info(f"Preflight OK — model '{MODEL_NAME}' is live on Groq")
+                return True
+
+            logger.error("=" * 62)
+            logger.error(f"MODEL '{MODEL_NAME}' IS NOT AVAILABLE ON GROQ")
+            logger.error("=" * 62)
+            logger.error("Groq retires models on a schedule. A retired model does not")
+            logger.error("error out at submission — it fails every request inside the")
+            logger.error("batch, so you get 'completed' batches with no output file.")
+            logger.error("")
+            logger.error("Currently available models on your account:")
+            for mid in sorted(ids)[:40]:
+                logger.error(f"    {mid}")
+            logger.error("")
+            logger.error('Set one in batch_config.json:  "MODEL_NAME": "openai/gpt-oss-120b"')
+            logger.error("See https://console.groq.com/docs/deprecations")
+            logger.error("=" * 62)
+            return False
+        except Exception as e:
+            # Never let a diagnostic block a run that might otherwise work
+            logger.warning(f"Could not verify model availability ({e}) — continuing anyway")
+            return True
+
     def process_file(self, input_file: str, output_file: str) -> None:
         """Main function to process the entire CSV/Excel file using batch API"""
         logger.info(f"Starting batch processing of {input_file}")
+
+        # Fix 28: fail in seconds on a dead model instead of 20 minutes of retries
+        if not self.verify_model_available():
+            raise RuntimeError(
+                f"Model '{MODEL_NAME}' is not available on Groq. "
+                f"Update MODEL_NAME in batch_config.json before rerunning. "
+                f"See the model list logged above."
+            )
 
         self.start_time = time.time()
         self.successful_rows = 0
@@ -2115,6 +2280,12 @@ def main():
         
         INPUT_FILE = config.get("INPUT_FILE", "./test_for_vps.xlsx")
         MAX_ROWS = config.get("MAX_ROWS", None)  # None for no limit
+
+        # Fix 28: let the model be swapped from config without editing code,
+        # so the next Groq deprecation is a one-line change.
+        global MODEL_NAME
+        MODEL_NAME = config.get("MODEL_NAME", MODEL_NAME)
+        logger.info(f"Using model: {MODEL_NAME}")
         
     except FileNotFoundError:
         logger.error("config.json file not found!")
@@ -2164,6 +2335,7 @@ def main():
     print(f"\n🚀 Starting BATCH processing:")
     print(f"   • Input file: {INPUT_FILE}")
     print(f"   • Max rows: {MAX_ROWS if MAX_ROWS else 'No limit'}")
+    print(f"   • Model: {MODEL_NAME}")
     print(f"   • Max requests per batch: 1,000 (auto-chunking enabled)")
     print(f"   • Cost savings: ~50% compared to real-time API")
     print(f"   • Processing mode: Batch (submit all → wait → get results)")
