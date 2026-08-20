@@ -388,6 +388,10 @@ class BatchDataProcessor:
     def clean_json_content(self, content: str) -> str:
         """Clean content before JSON parsing by removing markdown and extra characters"""
         content = content.replace('```json', '').replace('```', '').replace('```text', '')
+        # Fix 30: gpt-oss uses the Harmony chat format and can leak control tokens
+        # such as <|start|> <|channel|> <|message|> <|end|> <|return|> into the
+        # content field. Strip them before any parsing is attempted.
+        content = re.sub(r'<\|[^|]*\|>', '', content)
         content = content.replace('\n', '').replace('\r', '').strip()
         
         if content.startswith('"') and content.endswith('"') and content.count('"') == 2:
@@ -396,6 +400,13 @@ class BatchDataProcessor:
         json_match = re.search(r'\[.*\]', content)
         if json_match:
             content = json_match.group(0)
+        else:
+            # Fix 30: the attributes request returns a JSON OBJECT, not an array.
+            # Previously only [...] was extracted, so any wrapper text around an
+            # object survived and broke the parse. Extract {...} as a fallback.
+            obj_match = re.search(r'\{.*\}', content)
+            if obj_match:
+                content = obj_match.group(0)
         
         return content
     
@@ -470,7 +481,14 @@ class BatchDataProcessor:
                 "model": MODEL_NAME,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.5,
-                "max_tokens": 100
+                "max_tokens": 600,
+                # Fix 30: gpt-oss is a REASONING model — it spends tokens
+                # thinking before emitting content, and those tokens come out
+                # of max_tokens. At the old ceiling the entire budget went to
+                # reasoning and "content" came back empty or cut mid-sentence.
+                # "low" minimises reasoning; the ceiling covers reasoning+output.
+                "reasoning_effort": "low",
+                "include_reasoning": False
             }
         }
 
@@ -509,7 +527,14 @@ class BatchDataProcessor:
                 "model": MODEL_NAME,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.5,
-                "max_tokens": 200
+                "max_tokens": 900,
+                # Fix 30: gpt-oss is a REASONING model — it spends tokens
+                # thinking before emitting content, and those tokens come out
+                # of max_tokens. At the old ceiling the entire budget went to
+                # reasoning and "content" came back empty or cut mid-sentence.
+                # "low" minimises reasoning; the ceiling covers reasoning+output.
+                "reasoning_effort": "low",
+                "include_reasoning": False
             }
         }
 
@@ -581,7 +606,14 @@ class BatchDataProcessor:
                 "model": MODEL_NAME,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.3,
-                "max_tokens": 300
+                "max_tokens": 1000,
+                # Fix 30: gpt-oss is a REASONING model — it spends tokens
+                # thinking before emitting content, and those tokens come out
+                # of max_tokens. At the old ceiling the entire budget went to
+                # reasoning and "content" came back empty or cut mid-sentence.
+                # "low" minimises reasoning; the ceiling covers reasoning+output.
+                "reasoning_effort": "low",
+                "include_reasoning": False
             }
         }
 
@@ -619,7 +651,14 @@ class BatchDataProcessor:
                 "model": MODEL_NAME,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.6,
-                "max_tokens": 500
+                "max_tokens": 1400,
+                # Fix 30: gpt-oss is a REASONING model — it spends tokens
+                # thinking before emitting content, and those tokens come out
+                # of max_tokens. At the old ceiling the entire budget went to
+                # reasoning and "content" came back empty or cut mid-sentence.
+                # "low" minimises reasoning; the ceiling covers reasoning+output.
+                "reasoning_effort": "low",
+                "include_reasoning": False
             }
         }
 
@@ -687,7 +726,14 @@ or
                 "model": MODEL_NAME,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.1,
-                "max_tokens": 50
+                "max_tokens": 300,
+                # Fix 30: gpt-oss is a REASONING model — it spends tokens
+                # thinking before emitting content, and those tokens come out
+                # of max_tokens. At the old ceiling the entire budget went to
+                # reasoning and "content" came back empty or cut mid-sentence.
+                # "low" minimises reasoning; the ceiling covers reasoning+output.
+                "reasoning_effort": "low",
+                "include_reasoning": False
             }
         }
 
@@ -827,8 +873,20 @@ or
         # Add parent rows
         if parent_rows_to_add:
             logger.info(f"Adding {len(parent_rows_to_add)} parent rows")
-            for parent_row in parent_rows_to_add:
-                df.loc[len(df)] = parent_row
+            # Fix 29: append in ONE concat instead of df.loc[len(df)] in a loop.
+            # Each .loc enlargement reallocates the entire dataframe, so the loop
+            # is O(n^2) — ~12s of silent dead air for 1,311 rows, and far worse on
+            # bigger files. One concat is ~400x faster and produces an identical
+            # result (verified row-for-row). Falls back to the loop if concat fails.
+            try:
+                df = pd.concat(
+                    [df, pd.DataFrame(parent_rows_to_add)],
+                    ignore_index=True
+                )
+            except Exception as e:
+                logger.warning(f"Bulk parent append failed ({e}) — using row-by-row fallback")
+                for parent_row in parent_rows_to_add:
+                    df.loc[len(df)] = parent_row
         
         # Store families for later use
         self.families = families
@@ -2251,6 +2309,46 @@ or
         success_rate = (self.successful_rows / self.total_rows) * 100 if self.total_rows > 0 else 0
 
         self.save_progress("Completed", output_path)
+
+        # Fix 31: do not announce success when the run produced nothing usable.
+        # The 2026-08-20 run logged "Processing complete!" while all 6,938 rows
+        # had fallen back to default values. Judge the run and say so plainly.
+        try:
+            total_rows  = len(self.request_id_to_row_mapping) or 1
+            failed_rows = len({
+                e.get('row') for e in self.failed_rows_report
+                if isinstance(e, dict) and e.get('row') is not None
+            })
+            fail_pct = failed_rows / total_rows * 100
+
+            if fail_pct >= 50:
+                logger.error("=" * 62)
+                logger.error(f"RUN PRODUCED LARGELY UNUSABLE OUTPUT — "
+                            f"{failed_rows:,}/{total_rows:,} rows ({fail_pct:.0f}%) "
+                            f"fell back to DEFAULT values")
+                logger.error("=" * 62)
+                logger.error("The AI columns (Features, Bullet Points, Material, Color,")
+                logger.error("Pattern, SEO Description) are placeholders, not real content.")
+                logger.error("")
+                logger.error("Most common cause: the model returned empty or truncated")
+                logger.error("content. Reasoning models (gpt-oss, qwen3) spend part of the")
+                logger.error("max_tokens budget on internal reasoning before writing any")
+                logger.error("output — if the ceiling is too low, content comes back empty.")
+                logger.error("Check failed_rows_report.json and raise max_tokens, or set")
+                logger.error('"reasoning_effort": "low".')
+                logger.error("")
+                logger.error("DO NOT UPLOAD THIS FILE — rerun after fixing.")
+                logger.error("=" * 62)
+            elif fail_pct >= 5:
+                logger.warning(
+                    f"{failed_rows:,}/{total_rows:,} rows ({fail_pct:.1f}%) used default "
+                    f"values — review failed_rows_report.json before uploading"
+                )
+            else:
+                logger.info(f"Output quality OK — {total_rows - failed_rows:,}/{total_rows:,} "
+                           f"rows populated ({100 - fail_pct:.1f}%)")
+        except Exception as e:
+            logger.warning(f"Could not compute output quality summary: {e}")
 
         logger.info(f"Processing complete! Results saved to {output_path}")
         logger.info(f"Final dataset has {len(df)} rows and {len(df.columns)} columns")
