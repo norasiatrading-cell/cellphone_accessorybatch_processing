@@ -2048,6 +2048,112 @@ or
         )
         return df
 
+    def normalize_generated_text(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Fix 32: tidy the text columns this script generates.
+
+        Three defects observed in the 2026-08-20 gpt-oss run:
+
+        a. NON-ASCII LOOKALIKES in 100% of rows. gpt-oss emits typographic
+           characters that read like ASCII but are not:
+             U+2011 NON-BREAKING HYPHEN   690x  ("Built‑in", "high‑quality")
+             U+202F NARROW NO-BREAK SPACE  84x
+             U+2019 RIGHT SINGLE QUOTE     22x
+           Marketplace feed validators reject or mangle these, and search
+           tokenises "Built‑in" differently from "Built-in". LLaMA did not
+           do this — it is specific to the current model.
+
+        b. DANGLING SEPARATOR on 31/98 titles: "...Wrist Strap -" — the model
+           emitted the separator with nothing after it.
+
+        c. Stray double spaces and leading/trailing whitespace.
+
+        Only columns this script writes are touched. Source data, prices,
+        images and all numeric columns are left completely alone.
+        Wrapped so it can never abort a run.
+        """
+        # Lookalike → ASCII. Keep this list conservative: only characters
+        # with an unambiguous ASCII equivalent.
+        CHAR_MAP = {
+            '\u2011': '-',   # non-breaking hyphen
+            '\u2010': '-',   # hyphen
+            '\u2012': '-',   # figure dash
+            '\u2013': '-',   # en dash
+            '\u2014': '-',   # em dash
+            '\u2212': '-',   # minus sign
+            '\u2018': "'",   # left single quote
+            '\u2019': "'",   # right single quote
+            '\u201A': "'",
+            '\u201C': '"',   # left double quote
+            '\u201D': '"',   # right double quote
+            '\u00A0': ' ',   # no-break space
+            '\u202F': ' ',   # narrow no-break space
+            '\u2009': ' ',   # thin space
+            '\u200A': ' ',   # hair space
+            '\u2007': ' ',   # figure space
+            '\u2026': '...', # ellipsis
+            '\u00AD': '',    # soft hyphen (invisible)
+            '\u200B': '',    # zero-width space
+            '\u200C': '',    # zero-width non-joiner
+            '\u200D': '',    # zero-width joiner
+            '\uFEFF': '',    # BOM / zero-width no-break space
+        }
+
+        TEXT_COLS = (
+            [f'Feature_{i}' for i in range(1, 6)] +
+            [f'Bullet_Point_{i}' for i in range(1, 6)] +
+            ['New Title', 'New Title 2', 'Material', 'Color', 'Pattern',
+             'Type_of_Case', 'Compatible Device',
+             'New Description（without HTML format）']
+        )
+
+        def clean(val):
+            s = str(val)
+            if s in ('nan', 'None'):
+                return ''
+            for bad, good in CHAR_MAP.items():
+                if bad in s:
+                    s = s.replace(bad, good)
+            s = re.sub(r'[ \t]{2,}', ' ', s)   # collapse runs of spaces
+            return s.strip()
+
+        def strip_dangling_separator(val):
+            """Remove a trailing separator left with nothing after it."""
+            s = str(val).strip()
+            # e.g. "Wrist Strap -"  /  "Case –"  /  "Cover |"
+            prev = None
+            while prev != s:
+                prev = s
+                s = re.sub(r'[\s]*[-–—|,;:]+\s*$', '', s).strip()
+            return s
+
+        try:
+            present = [c for c in TEXT_COLS if c in df.columns]
+            chars_fixed = 0
+            for col in present:
+                before = df[col].astype(str)
+                after = before.map(clean)
+                chars_fixed += int((before != after).sum())
+                df[col] = after
+
+            titles_fixed = 0
+            for col in ('New Title', 'New Title 2'):
+                if col in df.columns:
+                    before = df[col].astype(str)
+                    after = before.map(strip_dangling_separator)
+                    titles_fixed += int((before != after).sum())
+                    df[col] = after
+
+            logger.info(
+                f"Fix32: normalised {chars_fixed} text cells across "
+                f"{len(present)} columns; stripped dangling separators from "
+                f"{titles_fixed} titles"
+            )
+        except Exception as e:
+            logger.error(f"Fix32 failed ({e}) — continuing with un-normalised text")
+
+        return df
+
     def calculate_prices(self, df: pd.DataFrame, row_idx: int) -> None:
         """Calculate price columns for a row"""
         # Safely convert value to float, return default if conversion fails
@@ -2282,6 +2388,10 @@ or
         # Update parent rows with 'A' variant data
         df = self.update_parent_rows(df)
         self.save_progress("Updating parent rows")
+
+        # Fix 32: normalise generated text LAST — after Fix22/Fix23 and after
+        # parent rows are populated, so parents get cleaned too.
+        df = self.normalize_generated_text(df)
 
         # Save results
         if not os.path.exists("output"):
